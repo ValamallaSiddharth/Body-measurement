@@ -5,17 +5,19 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 from .errors import CaptureError
-from .detection import detect_pose, segment_body, detect_chin, edges_touched
+from .detection import detect_pose, segment_body, detect_chin, detect_face_mesh_details, edges_touched
 
 # Adult engineering priors, NOT population-validated anthropometric standards.
-# All anthropometric tuning belongs here. Length error may be 10-20% or worse;
-# circumference error may be 15-30% or worse. These are not validated bounds.
 HEAD_REF_CM = {"male": 23.2, "female": 21.8}
 BASELINE_HEIGHT_CM = {"male": 175.0, "female": 162.0}
-HEAD_BODY_RATIO_RANGE = (0.11, 0.16)  # Reject unreliable front chin/vertex anchors.
-HEAD_REGION_HALF_WIDTH_TO_SHOULDERS = 0.55  # Excludes raised hands from vertex search.
+POPULATION_PRIOR = {
+    "male": {"mean": 175.0, "sd": 7.0},
+    "female": {"mean": 162.0, "sd": 6.5}
+}
+HEAD_BODY_RATIO_RANGE = (0.11, 0.16)
+HEAD_REGION_HALF_WIDTH_TO_SHOULDERS = 0.55
 HEAD_REGION_MIN_HALF_WIDTH_TO_IMAGE = 0.06
-SHOULDER_BAND_HEIGHT_RATIO = 0.03  # Maximum outer span in shoulder row +/- 3%.
+SHOULDER_BAND_HEIGHT_RATIO = 0.03
 DELTOID_TO_HEIGHT_RATIO = {"male": 0.25, "female": 0.235}
 DELTOID_HEIGHT_RANGE = (0.16, 0.35)
 CHEST_LEVEL_IN_TORSO = 0.23
@@ -28,16 +30,16 @@ DEPTH_WIDTH_MIN, DEPTH_WIDTH_MAX = 0.40, 1.00
 TORSO_DEPTH_TO_WIDTH = {"neck": 0.85, "chest": 0.68, "waist": 0.72, "hips": 0.72}
 ARM_HINT_ROW_HEIGHT_RATIO = 0.025
 ARM_HINT_OUTER_RUN_FRACTION = 0.25
-ARM_HINT_PRIOR_EXCESS = 1.15  # Hints trigger fallback only with excessive spans.
+ARM_HINT_PRIOR_EXCESS = 1.15
 WAIST_HIP_DEPTH_TRIGGER = 1.05
-WAIST_HIP_DEPTH_FALLBACK = 0.90  # Applied ONLY to an arm-contaminated waist.
-WRIST_TO_HEIGHT_RATIO = {"male": 0.100, "female": 0.095}  # Circumference prior.
+WAIST_HIP_DEPTH_FALLBACK = 0.90
+WRIST_TO_HEIGHT_RATIO = {"male": 0.100, "female": 0.095}
 WRIST_HEIGHT_RANGE = (0.065, 0.145)
 WRIST_DIAMETER_HEIGHT_MAX = 0.045
 WRIST_SCAN_HALF_HEIGHT_RATIO = 0.10
 WRIST_HIP_PROXIMITY_HEIGHT_RATIO = 0.12
 THIGH_HIP_TO_KNEE_FRACTION = 0.30
-THIGH_TO_HEIGHT_RATIO = {"male": 0.32, "female": 0.31}  # Circumference prior.
+THIGH_TO_HEIGHT_RATIO = {"male": 0.32, "female": 0.31}
 THIGH_HEIGHT_RANGE = (0.20, 0.50)
 THIGH_DEPTH_WIDTH_RANGE = (0.40, 2.0)
 LENGTH_TO_HEIGHT = {"arm_length": 0.34, "torso_length": 0.29, "inseam": 0.45}
@@ -45,7 +47,6 @@ LENGTH_HEIGHT_RANGE = {"arm_length": (0.20, 0.50), "torso_length": (0.18, 0.40),
 ADULT_HEIGHT_RANGE_CM = (120, 220)
 LANDMARK_VISIBILITY_MIN = 0.5
 EDGE_TOLERANCE_PX = 2
-
 
 
 @dataclass
@@ -61,6 +62,10 @@ class View:
     chin: float | None = None
     cm_per_px: float = 0.0
     traces: list = field(default_factory=list)
+    torso_mask: np.ndarray | None = None
+    arm_mask: np.ndarray | None = None
+    face_meta: dict = field(default_factory=dict)
+    scale_meta: dict = field(default_factory=dict)
 
     @property
     def body_px_height(self):
@@ -71,13 +76,32 @@ def point_in_image(point, shape):
     return np.clip(np.asarray(point, dtype=float), [0, 0], [shape[1]-1, shape[0]-1])
 
 
+def camera_tilt_cosine(view):
+    """Estimate camera vertical tilt from body midline vector."""
+    if min(view.visibility[[11, 12, 27, 28]]) >= LANDMARK_VISIBILITY_MIN:
+        mid_s = view.points[[11, 12]].mean(axis=0)
+        mid_a = view.points[[27, 28]].mean(axis=0)
+        dx = abs(mid_s[0] - mid_a[0])
+        dy = abs(mid_s[1] - mid_a[1])
+        if dy > 50:
+            angle = math.atan2(dx, dy)
+            if angle > math.radians(2.5):
+                return float(max(0.85, math.cos(angle)))
+    return 1.0
+
+
 def prepare_view(image, name, notes):
     points, visibility = detect_pose(image, name, notes)
     mask = segment_body(image, name, notes)
     h, w = mask.shape
     points = np.clip(points, [0, 0], [w-1, h-1])
     ys, _ = np.where(mask > 0)
-    # Search only the head region above shoulders, centered on the pose nose.
+    
+    face_meta = detect_face_mesh_details(image, points, name) if name == "front" else {}
+    chin = face_meta.get("chin")
+    if chin is None and name == "front":
+        chin = detect_chin(image, points, name, notes)
+
     half_width = max(abs(points[11, 0]-points[12, 0])*HEAD_REGION_HALF_WIDTH_TO_SHOULDERS,
                      w*HEAD_REGION_MIN_HALF_WIDTH_TO_IMAGE)
     x0, x1 = np.clip([math.floor(points[0, 0]-half_width), math.ceil(points[0, 0]+half_width)+1], 0, w).astype(int)
@@ -86,6 +110,15 @@ def prepare_view(image, name, notes):
     vertex = float(head_ys.min()) if head_ys.size else float(ys.min())
     if not head_ys.size:
         notes.append(f"{name.title()} head region is uncertain; silhouette top was used.")
+
+    # Skull curve vs hair volume
+    if face_meta.get("eyes_y") is not None and chin is not None:
+        d_eye_chin = chin - face_meta["eyes_y"]
+        if d_eye_chin > 5:
+            skull_limit = face_meta["eyes_y"] - 1.25 * d_eye_chin
+            if vertex < skull_limit:
+                vertex = float(skull_limit)
+
     touched = tuple(edges_touched(mask, EDGE_TOLERANCE_PX))
     if touched:
         notes += [f"{name.title()} silhouette is close to the image edge",
@@ -94,17 +127,29 @@ def prepare_view(image, name, notes):
             notes.append("Feet may be cut off; height may be underestimated")
         if "top" in touched:
             notes.append("Head may be cut off; height and scale may be inaccurate")
+
     feet = [i for i in (29, 30, 31, 32) if visibility[i] > LANDMARK_VISIBILITY_MIN]
     if not feet:
         feet = [i for i in (27, 28) if visibility[i] > LANDMARK_VISIBILITY_MIN]
-    foot_y = float(points[feet, 1].max()) if feet else float(ys.max())
-    ground = foot_y if "bottom" in touched else max(foot_y, float(ys.max()))
+        if "bottom" in touched and feet:
+            ank_y = float(points[feet, 1].max())
+            foot_offset = max(8.0, 0.045 * (ank_y - vertex))
+            ground = float(min(h - 1, ank_y + foot_offset))
+            notes.append("Feet appear cut off; ground level estimated from ankles with foot-height offset.")
+        else:
+            foot_y = float(points[feet, 1].max()) if feet else float(ys.max())
+            ground = foot_y if "bottom" in touched else max(foot_y, float(ys.max()))
+    else:
+        foot_y = float(points[feet, 1].max())
+        ground = foot_y if "bottom" in touched else max(foot_y, float(ys.max()))
+
     ground = float(np.clip(ground, 0, h-1))
     if ground <= vertex:
         vertex, ground = float(ys.min()), float(ys.max())
         notes.append(f"{name.title()} foot geometry failed; using visible silhouette span.")
     if ground-vertex < 100:
         raise CaptureError(f"{name.title()} body is too small or incomplete; include the full body with a clear background.")
+
     for i in (11, 12, 23, 24, 25, 26, 27, 28):
         if visibility[i] < LANDMARK_VISIBILITY_MIN:
             continue
@@ -115,8 +160,10 @@ def prepare_view(image, name, notes):
                 notes.append(f"{name.title()} boundary joint is outside the visible silhouette.")
             else:
                 raise CaptureError(f"{name.title()} segmentation misses body joints; improve lighting and background contrast.")
-    chin = detect_chin(image, points, name, notes) if name == "front" else None
-    return View(name, image, mask, points, visibility, vertex, ground, touched, chin)
+
+    view_obj = View(name, image, mask, points, visibility, vertex, ground, touched, chin, face_meta=face_meta)
+    build_torso_mask(view_obj)
+    return view_obj
 
 
 def metric(value, source):
@@ -124,7 +171,6 @@ def metric(value, source):
 
 
 def validate_height(value):
-    """Reference-object calibration can later supply this same metric anchor."""
     if value is None or value == "":
         return None
     try:
@@ -137,31 +183,182 @@ def validate_height(value):
 
 
 def estimate_scale(front, side, gender, notes, height_cm=None):
-    """Derive absolute scale ONCE from the front head; normalize side separately."""
+    """Derive multi-cue fused scale without user height; optional known stature overrides."""
     known_height = validate_height(height_cm)
-    head_px = front.chin-front.vertex if front.chin is not None else float("nan")
-    ratio = head_px/front.body_px_height
-    if math.isfinite(ratio) and HEAD_BODY_RATIO_RANGE[0] <= ratio <= HEAD_BODY_RATIO_RANGE[1]:
-        front.cm_per_px = HEAD_REF_CM[gender]/head_px
-        height_cm = front.body_px_height*front.cm_per_px
-        source = "estimated"
-        if known_height is None:
-            notes.append("Height estimated using an adult head-size prior; absolute size is uncalibrated.")
-    elif known_height is None:
-        height_cm = BASELINE_HEIGHT_CM[gender]
-        front.cm_per_px = height_cm/front.body_px_height
-        source = "assumed"
-        reason = "front face/chin not detected" if front.chin is None else "front head/body ratio outside 0.11-0.16"
-        notes.append(f"Height is not measured: {reason}; assuming {height_cm:.1f} cm adult baseline.")
-        notes.append("All dimensions using the assumed height scale are labeled estimated.")
+    head_px = (front.chin - front.vertex) if front.chin is not None else float("nan")
+    ratio = head_px / front.body_px_height
+
     if known_height is not None:
         if math.isfinite(ratio) and HEAD_BODY_RATIO_RANGE[0] <= ratio <= HEAD_BODY_RATIO_RANGE[1]:
-            if abs(height_cm-known_height)/known_height > 0.10:
+            est_h = front.body_px_height * (HEAD_REF_CM[gender] / head_px)
+            if abs(est_h - known_height) / known_height > 0.10:
                 notes.append("Head-based height and user-supplied height disagree by more than 10%; check capture and entered height.")
-        height_cm, source = known_height, "measured"
-        front.cm_per_px = height_cm/front.body_px_height
-    side.cm_per_px = height_cm/side.body_px_height
+        height_cm = known_height
+        source = "measured"
+        front.cm_per_px = height_cm / front.body_px_height
+        side.cm_per_px = height_cm / side.body_px_height
+        front.scale_meta = {
+            "uncertainty_cm": 0.0,
+            "uncertainty_band": f"{round(height_cm, 1)} cm +/- 0.0",
+            "cues_used": ["user_height"],
+        }
+        return height_cm, source
+
+    cos_tilt = camera_tilt_cosine(front)
+    eff_front_body_h = front.body_px_height / cos_tilt
+
+    cues = []
+    pitch_cos = front.face_meta.get("pitch_cosine", 1.0) if hasattr(front, "face_meta") else 1.0
+    if math.isfinite(head_px) and head_px > 10:
+        head_px_unproj = head_px / pitch_cos
+        r = head_px_unproj / eff_front_body_h
+        if HEAD_BODY_RATIO_RANGE[0] <= r <= HEAD_BODY_RATIO_RANGE[1]:
+            h_head = eff_front_body_h * (HEAD_REF_CM[gender] / head_px_unproj)
+            cues.append(("head_prior", float(h_head), 7.0))
+
+    if np.all(front.visibility[[7, 8, 11, 12]] >= LANDMARK_VISIBILITY_MIN):
+        ear_y = float(front.points[[7, 8], 1].mean())
+        sh_y = float(front.points[[11, 12], 1].mean())
+        neck_px = abs(sh_y - ear_y)
+        if neck_px > 5:
+            ref_neck = 22.0 if gender == "male" else 20.0
+            h_neck = eff_front_body_h * (ref_neck / neck_px)
+            if 140 <= h_neck <= 210:
+                cues.append(("neck_shoulder_cue", float(h_neck), 9.0))
+
+    if min(front.visibility[[11, 12, 23, 24]]) >= LANDMARK_VISIBILITY_MIN:
+        mid_s = front.points[[11, 12]].mean(axis=0)
+        mid_h = front.points[[23, 24]].mean(axis=0)
+        torso_px = float(np.linalg.norm(mid_s - mid_h))
+        ref_torso = 49.8 if gender == "male" else 45.8
+        h_torso = eff_front_body_h * (ref_torso / torso_px)
+        if 140 <= h_torso <= 210:
+            cues.append(("torso_proportion", float(h_torso), 8.5))
+
+    if min(front.visibility[[23, 24, 27, 28]]) >= LANDMARK_VISIBILITY_MIN:
+        mid_h = front.points[[23, 24]].mean(axis=0)
+        mid_a = front.points[[27, 28]].mean(axis=0)
+        leg_px = float(np.linalg.norm(mid_h - mid_a))
+        ref_leg = 82.0 if gender == "male" else 75.0
+        h_leg = eff_front_body_h * (ref_leg / leg_px)
+        if 140 <= h_leg <= 210:
+            cues.append(("leg_proportion", float(h_leg), 9.0))
+
+    if side is not None and side.chin is not None:
+        side_head_px = side.chin - side.vertex
+        if side_head_px > 10:
+            h_side = side.body_px_height * (HEAD_REF_CM[gender] / side_head_px)
+            if 140 <= h_side <= 210:
+                cues.append(("side_head_cue", float(h_side), 9.0))
+
+    prior_mean = POPULATION_PRIOR[gender]["mean"]
+    prior_sd = POPULATION_PRIOR[gender]["sd"]
+
+    if not cues:
+        height_cm = prior_mean
+        source = "assumed"
+        uncertainty = 10.0
+        cues_used = ["adult_baseline"]
+        notes.append(f"Height is not measured: landmarks uncertain; assuming {height_cm:.1f} cm adult baseline.")
+    else:
+        vals = np.array([c[1] for c in cues])
+        med = float(np.median(vals))
+        valid_cues = []
+        if len(cues) > 2:
+            diffs = np.abs(vals - med)
+            mad = float(np.median(diffs)) or 5.0
+            for c_name, h_val, sd_val in cues:
+                if abs(h_val - med) <= max(14.0, 2.5 * 1.4826 * mad):
+                    valid_cues.append((c_name, h_val, sd_val))
+                else:
+                    notes.append(f"Dropped outlier scale cue {c_name} ({h_val:.1f} cm).")
+        else:
+            valid_cues = cues
+
+        if not valid_cues:
+            valid_cues = cues
+
+        if len(valid_cues) == 1:
+            w_prior = (1.0 / (prior_sd ** 2)) * 1.5
+            notes.append("Only a single scale cue was available; height shrunk toward population prior.")
+        elif len(valid_cues) >= 3:
+            w_prior = (1.0 / (prior_sd ** 2)) * 0.35
+        else:
+            w_prior = (1.0 / (prior_sd ** 2)) * 0.8
+        weights = [1.0 / (sd_val ** 2) for _, _, sd_val in valid_cues]
+        total_w = sum(weights) + w_prior
+        height_cm = float((sum(w * h for (_, h, _), w in zip(valid_cues, weights)) + w_prior * prior_mean) / total_w)
+        uncertainty = float(min(8.0, max(3.5, 1.96 * np.sqrt(1.0 / total_w))))
+        cues_used = [c[0] for c in valid_cues] + ["population_regularizer"]
+        source = "estimated"
+        notes.append("Height estimated via multi-cue fusion with population regularization; absolute size is uncalibrated.")
+
+    if side is not None and cues:
+        side_cues = [c[1] for c in cues if "side" in c[0]]
+        front_cues = [c[1] for c in cues if "side" not in c[0]]
+        if side_cues and front_cues:
+            if abs(np.mean(side_cues) - np.mean(front_cues)) / height_cm > 0.06:
+                notes.append("Front and side view height cues disagree by more than 6%; perspective or posture differences may affect accuracy.")
+
+    front.cm_per_px = height_cm / front.body_px_height
+    side.cm_per_px = height_cm / side.body_px_height
+    front.scale_meta = {
+        "uncertainty_cm": round(uncertainty, 1),
+        "uncertainty_band": f"{round(height_cm, 1)} cm +/- {round(uncertainty, 1)}",
+        "cues_used": cues_used,
+    }
     return height_cm, source
+
+
+def build_torso_mask(view):
+    """Fix 1: Subtract arms (shoulder-elbow-wrist lines + wrist hand disc) from the silhouette."""
+    arm_mask = np.zeros_like(view.mask)
+    body_h = view.body_px_height
+    t_arm = max(4, int(0.045 * body_h))
+    t_forearm = max(3, int(t_arm * 0.85))
+    r_hand = max(4, int(t_forearm * 1.3))
+
+    if view.name == "front":
+        arm_chains = [(11, 13, 15), (12, 14, 16)]
+    else:
+        vis_l = min(view.visibility[[11, 13, 15]])
+        vis_r = min(view.visibility[[12, 14, 16]])
+        if vis_l >= 0.4 and vis_r >= 0.4:
+            arm_chains = [(11, 13, 15), (12, 14, 16)]
+        elif vis_l >= vis_r:
+            arm_chains = [(11, 13, 15)]
+        else:
+            arm_chains = [(12, 14, 16)]
+
+    for s_idx, e_idx, w_idx in arm_chains:
+        s = tuple(np.rint(view.points[s_idx]).astype(int))
+        e = tuple(np.rint(view.points[e_idx]).astype(int))
+        wr = tuple(np.rint(view.points[w_idx]).astype(int))
+        cv2.line(arm_mask, s, e, 255, thickness=t_arm)
+        cv2.line(arm_mask, e, wr, 255, thickness=t_forearm)
+        cv2.circle(arm_mask, wr, r_hand, 255, thickness=-1)
+
+    torso_mask = view.mask.copy()
+    torso_mask[arm_mask > 0] = 0
+    view.arm_mask = arm_mask
+    view.torso_mask = torso_mask
+    return torso_mask
+
+
+def get_torso_corridor(view, y):
+    """Left and right corridor bounds between shoulders and hips, expanded by margin."""
+    p11, p12 = view.points[11], view.points[12]
+    p23, p24 = view.points[23], view.points[24]
+    s_y = 0.5 * (p11[1] + p12[1])
+    h_y = 0.5 * (p23[1] + p24[1])
+    dy = max(1.0, h_y - s_y)
+    t = float(np.clip((y - s_y) / dy, -0.2, 1.2))
+
+    x_l = p11[0] + t * (p23[0] - p11[0])
+    x_r = p12[0] + t * (p24[0] - p12[0])
+    x_min, x_max = min(x_l, x_r), max(x_l, x_r)
+    margin = max(6.0, 0.05 * view.body_px_height, 0.15 * abs(p11[0] - p12[0]))
+    return float(x_min - margin), float(x_max + margin)
 
 
 def row_runs(mask, y):
@@ -177,10 +374,26 @@ def mask_run(view, y, x):
     point = point_in_image([x, y], view.mask.shape)
     row, runs = row_runs(view.mask, point[1])
     if x < 0 or x > view.mask.shape[1]-1 or y < 0 or y > view.mask.shape[0]-1:
-        return None  # Clamped safely, but do not invent geometry outside the photo.
+        return None
     for left, right in runs:
         if left <= point[0] <= right:
             return float(right-left+1), np.array([left, row]), np.array([right, row])
+    return None
+
+
+def mask_run_custom(mask, y, x):
+    """Continuous foreground run in given mask containing the target x."""
+    if mask is None or not np.isfinite([x, y]).all():
+        return None
+    h, w = mask.shape
+    row = int(np.clip(round(y), 0, h - 1))
+    target_x = int(np.clip(round(x), 0, w - 1))
+    changes = np.diff(np.pad((mask[row] > 0).astype(np.int16), (1, 1)))
+    starts = np.flatnonzero(changes == 1)
+    ends = np.flatnonzero(changes == -1) - 1
+    for left, right in zip(starts, ends):
+        if left - 2 <= target_x <= right + 2:
+            return float(right - left + 1), np.array([left, row]), np.array([right, row])
     return None
 
 
@@ -232,7 +445,6 @@ def arm_hint(view, y, span):
         for index in (elbow, wrist):
             if view.visibility[index] > LANDMARK_VISIBILITY_MIN and abs(view.points[index, 1]-y) <= ARM_HINT_ROW_HEIGHT_RATIO*view.body_px_height:
                 hints.append(view.points[index, 0])
-        # Interpolate only when BOTH forearm landmarks are visible.
         if min(view.visibility[[elbow, wrist]]) > LANDMARK_VISIBILITY_MIN:
             a, b = view.points[elbow], view.points[wrist]
             if min(a[1], b[1]) <= y <= max(a[1], b[1]) and abs(b[1]-a[1]) > 1:
@@ -261,46 +473,99 @@ def torso_measurements(front, side, height, gender, scale_source, deltoid_cm, de
     levels = {"neck": (chin_y+shoulder_y)/2,
               "chest": shoulder_y+CHEST_LEVEL_IN_TORSO*(hip_y-shoulder_y),
               "waist": shoulder_y+WAIST_LEVEL_IN_TORSO*(hip_y-shoulder_y), "hips": hip_y}
+    
+    if front.torso_mask is None:
+        build_torso_mask(front)
+    if side.torso_mask is None:
+        build_torso_mask(side)
+
     dimensions = {}
+    fallback_levels = []
     for name, front_y in levels.items():
         normalized_y = (front_y-front.vertex)/front.body_px_height
         side_y = side.vertex+normalized_y*side.body_px_height
-        front_span = mask_run(front, front_y, axis_x(front, front_y))
-        side_span = mask_run(side, side_y, axis_x(side, side_y))
-        width = front_span[0]*front.cm_per_px if front_span else float("nan")
-        depth = side_span[0]*side.cm_per_px if side_span else float("nan")
-        estimated_width = TORSO_WIDTH_TO_DELTOID[name]*deltoid_cm
-        reasons = []
+
+        axis_front = axis_x(front, front_y)
+        axis_side = axis_x(side, side_y)
+
+        raw_front_span = mask_run(front, front_y, axis_front)
+        raw_side_span = mask_run(side, side_y, axis_side)
+
+        c_left, c_right = get_torso_corridor(front, front_y)
+        t_front_span = mask_run_custom(front.torso_mask, front_y, axis_front)
+        t_side_span = mask_run_custom(side.torso_mask, side_y, axis_side)
+
         contaminated = False
+        reasons = []
+
+        if raw_front_span is not None:
+            raw_w, p_left, p_right = raw_front_span
+            if p_left[0] < c_left or p_right[0] > c_right:
+                contaminated = True
+                reasons.append("front run is excessively wide and may include arms")
+            row_idx = int(np.clip(round(front_y), 0, front.mask.shape[0]-1))
+            if front.arm_mask is not None and np.any(front.arm_mask[row_idx, int(p_left[0]):int(p_right[0])+1] > 0):
+                contaminated = True
+                reasons.append("visible forearm hints indicate a merged arm")
+
+        chosen_front_span = None
+        if t_front_span is not None:
+            w_t, pl_t, pr_t = t_front_span
+            cl = max(pl_t[0], c_left)
+            cr = min(pr_t[0], c_right)
+            if cr > cl:
+                chosen_front_span = (float(cr - cl + 1), np.array([cl, front_y]), np.array([cr, front_y]))
+        elif raw_front_span is not None:
+            w_r, pl_r, pr_r = raw_front_span
+            cl = max(pl_r[0], c_left)
+            cr = min(pr_r[0], c_right)
+            if cr > cl:
+                chosen_front_span = (float(cr - cl + 1), np.array([cl, front_y]), np.array([cr, front_y]))
+
+        chosen_side_span = t_side_span or raw_side_span
+
+        width = chosen_front_span[0]*front.cm_per_px if chosen_front_span else float("nan")
+        depth = chosen_side_span[0]*side.cm_per_px if chosen_side_span else float("nan")
+        estimated_width = TORSO_WIDTH_TO_DELTOID[name]*deltoid_cm
+
         if not math.isfinite(width) or not math.isfinite(depth) or width <= 0 or depth <= 0:
             reasons.append("a torso-axis mask run is missing")
         else:
             if width > TORSO_WIDTH_MAX[name]*deltoid_cm:
                 contaminated = True
-                reasons.append("front run is excessively wide and may include arms")
+                if "front run is excessively wide and may include arms" not in reasons:
+                    reasons.append("front run is excessively wide and may include arms")
             if width < TORSO_WIDTH_MIN[name]*deltoid_cm:
                 reasons.append("front mask run is too narrow")
             if not DEPTH_WIDTH_MIN <= depth/width <= DEPTH_WIDTH_MAX:
                 contaminated = True
                 reasons.append("side depth/front width ratio is implausible")
-            if (arm_hint(front, front_y, front_span) and width > estimated_width*ARM_HINT_PRIOR_EXCESS) or (
-                    arm_hint(side, side_y, side_span) and depth > width*TORSO_DEPTH_TO_WIDTH[name]*ARM_HINT_PRIOR_EXCESS):
+            if (arm_hint(front, front_y, raw_front_span) and width > estimated_width*ARM_HINT_PRIOR_EXCESS) or (
+                    arm_hint(side, side_y, raw_side_span) and depth > width*TORSO_DEPTH_TO_WIDTH[name]*ARM_HINT_PRIOR_EXCESS):
                 contaminated = True
-                reasons.append("visible forearm hints indicate a merged arm")
+                if "visible forearm hints indicate a merged arm" not in reasons:
+                    reasons.append("visible forearm hints indicate a merged arm")
+
         if min(front.visibility[[11, 12, 23, 24]]) <= LANDMARK_VISIBILITY_MIN or max(side.visibility[[11, 12]]) <= LANDMARK_VISIBILITY_MIN or max(side.visibility[[23, 24]]) <= LANDMARK_VISIBILITY_MIN:
             reasons.append("torso landmarks have low visibility")
+
         source = "measured" if scale_source == "measured" else "estimated"
-        if reasons:
+        if reasons or contaminated:
             width, depth = estimated_width, estimated_width*TORSO_DEPTH_TO_WIDTH[name]
             source = "estimated"
+            fallback_levels.append(name)
             notes.append(f"{name.title()} estimated from deltoid proportions: {'; '.join(reasons)}.")
-            if deltoid_source == "estimated":
-                notes.append(f"{name.title()} fallback also depends on estimated shoulder width.")
+
         if name == "neck" and front.chin is None:
             source = "estimated"
             notes.append("Neck row estimated because the front chin was not detected.")
+
         dimensions[name] = {"width": width, "depth": depth, "source": source, "contaminated": contaminated,
-                            "front_span": front_span, "side_span": side_span}
+                            "front_span": chosen_front_span, "side_span": chosen_side_span}
+
+    if fallback_levels:
+        notes.append("Tip: Keep arms slightly away from the body in the front and side photos for accurate torso measurements.")
+
     constrain_waist_depth(dimensions, notes)
     values = {}
     for name, dimension in dimensions.items():
@@ -333,7 +598,7 @@ def perpendicular_wrist_span(view, elbow, wrist):
     while right+1 < len(foreground) and foreground[right+1]:
         right += 1
     if left == 0 or right == len(foreground)-1:
-        return None  # Diameter did not terminate inside the search window.
+        return None
     return float(right-left+1), positions[left], positions[right]
 
 
@@ -369,44 +634,85 @@ def wrist_measurement(front, side, height, gender, scale_source, notes):
     return metric(float(np.mean([item[0] for item in candidates])), source)
 
 
+def find_crotch(view):
+    """Fix 2: Find crotch point where the central run splits into two legs."""
+    h, w = view.mask.shape
+    hip_y = float(view.points[[23, 24], 1].mean())
+    knee_y = float(view.points[[25, 26], 1].mean())
+    mid_x = float(view.points[[23, 24], 0].mean())
+    scan_start = int(np.clip(round(hip_y + 0.05 * (knee_y - hip_y)), 0, h - 1))
+    scan_end = int(np.clip(round(knee_y), 0, h))
+
+    for y in range(scan_start, scan_end):
+        changes = np.diff(np.pad((view.mask[y] > 0).astype(np.int16), (1, 1)))
+        starts = np.flatnonzero(changes == 1)
+        ends = np.flatnonzero(changes == -1) - 1
+        runs = list(zip(starts, ends))
+        mid_idx = int(np.clip(round(mid_x), 0, w - 1))
+        if view.mask[y, mid_idx] == 0:
+            left_runs = [r for r in runs if r[1] < mid_x + 2]
+            right_runs = [r for r in runs if r[0] > mid_x - 2]
+            if left_runs and right_runs:
+                return float(y)
+    return None
+
+
 def thigh_measurement(front, side, height, gender, scale_source, notes):
     estimates = []
     source = "measured" if scale_source == "measured" else "estimated"
     midline = float(front.points[[23, 24], 0].mean())
+    crotch_y = find_crotch(front)
+    hip_y = float(front.points[[23, 24], 1].mean())
+    knee_y = float(front.points[[25, 26], 1].mean())
+
+    if crotch_y is not None:
+        thigh_y = crotch_y + 0.30 * (knee_y - crotch_y)
+    else:
+        thigh_y = hip_y + THIGH_HIP_TO_KNEE_FRACTION * (knee_y - hip_y)
+
+    legs_merged = False
     for hip, knee in ((23, 25), (24, 26)):
-        p = front.points[hip] + THIGH_HIP_TO_KNEE_FRACTION*(front.points[knee]-front.points[hip])
-        span = mask_run(front, p[1], p[0])
+        p_x = float(front.points[hip, 0] + THIGH_HIP_TO_KNEE_FRACTION * (front.points[knee, 0] - front.points[hip, 0]))
+        span = mask_run(front, thigh_y, p_x)
         leg_source = "measured" if scale_source == "measured" else "estimated"
         if span is not None:
-            other_hip, other_knee = (24, 26) if hip == 23 else (23, 25)
-            other = front.points[other_hip] + THIGH_HIP_TO_KNEE_FRACTION*(front.points[other_knee]-front.points[other_hip])
+            other_hip = 24 if hip == 23 else 23
+            other_x = float(front.points[other_hip, 0])
             _, left, right = span
-            if left[0] <= other[0] <= right[0]:
+            if (left[0] < midline < right[0]) and (left[0] <= other_x <= right[0]):
+                legs_merged = True
                 split = float(np.clip(midline, left[0], right[0]))
-                if front.points[hip, 0] < front.points[other_hip, 0]:
+                if front.points[hip, 0] < other_x:
                     right = np.array([split, left[1]])
                 else:
                     left = np.array([split, right[1]])
-                span = float(right[0]-left[0]+1), left, right
+                span = float(right[0] - left[0] + 1), left, right
                 leg_source = "estimated"
-                notes.append("Thigh width estimated by splitting merged front legs at the hip midpoint.")
-        normalized_y = (p[1]-front.vertex)/front.body_px_height
-        side_y = side.vertex+normalized_y*side.body_px_height
+
+        normalized_y = (thigh_y - front.vertex) / front.body_px_height
+        side_y = side.vertex + normalized_y * side.body_px_height
         sspan = mask_run(side, side_y, axis_x(side, side_y, (23, 24), (25, 26)))
-        reliable = min(front.visibility[[hip, knee]]) > LANDMARK_VISIBILITY_MIN and max(side.visibility[[23, 24]]) > LANDMARK_VISIBILITY_MIN and max(side.visibility[[25, 26]]) > LANDMARK_VISIBILITY_MIN
+        reliable = (min(front.visibility[[hip, knee]]) > LANDMARK_VISIBILITY_MIN and
+                    max(side.visibility[[23, 24]]) > LANDMARK_VISIBILITY_MIN and
+                    max(side.visibility[[25, 26]]) > LANDMARK_VISIBILITY_MIN)
+
         value = float("nan")
         if reliable and span is not None and sspan is not None:
-            width, depth = span[0]*front.cm_per_px, sspan[0]*side.cm_per_px
-            if width > 0 and THIGH_DEPTH_WIDTH_RANGE[0] <= depth/width <= THIGH_DEPTH_WIDTH_RANGE[1]:
+            width, depth = span[0] * front.cm_per_px, sspan[0] * side.cm_per_px
+            if width > 0 and THIGH_DEPTH_WIDTH_RANGE[0] <= depth / width <= THIGH_DEPTH_WIDTH_RANGE[1]:
                 value = ellipse_circumference(width, depth)
-        if not math.isfinite(value) or not THIGH_HEIGHT_RANGE[0] <= value/height <= THIGH_HEIGHT_RANGE[1]:
-            value, leg_source = THIGH_TO_HEIGHT_RATIO[gender]*height, "estimated"
-            notes.append("Thigh circumference estimated from height: one leg slice is missing, low visibility or implausible.")
+        if not math.isfinite(value) or not THIGH_HEIGHT_RANGE[0] <= value / height <= THIGH_HEIGHT_RANGE[1]:
+            value, leg_source = THIGH_TO_HEIGHT_RATIO[gender] * height, "estimated"
+
         estimates.append(value)
         if leg_source == "estimated":
             source = "estimated"
         record_span(front, "thigh", span, leg_source)
         record_span(side, "thigh", sspan, leg_source)
+
+    if legs_merged:
+        notes.append("Thigh width estimated by splitting merged front legs at the pelvis midline: legs merged.")
+
     return metric(float(np.mean(estimates)), source)
 
 
@@ -416,45 +722,52 @@ def length_measurements(front, height, scale_source, notes):
     arms = [sum(float(np.linalg.norm(points[a]-points[b])) for a, b in zip(ids, ids[1:]))*front.cm_per_px
             for ids in ((11, 13, 15), (12, 14, 16)) if min(front.visibility[list(ids)]) > LANDMARK_VISIBILITY_MIN]
     hip_mid = points[[23, 24]].mean(axis=0)
+
+    crotch_y = find_crotch(front)
+    ankles_y = float(points[[27, 28], 1].mean())
+    if crotch_y is not None and ankles_y > crotch_y + 15:
+        inseam_val = (ankles_y - crotch_y) * front.cm_per_px
+        inseam_src = "measured" if scale_source == "measured" else "estimated"
+        notes.append("Inseam measured from segmented crotch level to ankle.")
+    else:
+        inseam_val = float(np.linalg.norm(points[[27, 28]].mean(axis=0)-hip_mid))*front.cm_per_px
+        inseam_src = "estimated"
+        notes.append("Inseam is an estimated hip-midpoint-to-ankle proxy; Pose has no crotch landmark.")
+
     raw = {"arm_length": float(np.mean(arms)) if arms else float("nan"),
            "torso_length": float(np.linalg.norm(points[[11, 12]].mean(axis=0)-hip_mid))*front.cm_per_px,
-           "inseam": float(np.linalg.norm(points[[27, 28]].mean(axis=0)-hip_mid))*front.cm_per_px}
+           "inseam": inseam_val}
     for name, value in raw.items():
-        source = "measured" if scale_source == "measured" else "estimated"
+        source = inseam_src if name == "inseam" else ("measured" if scale_source == "measured" else "estimated")
         bounds = LENGTH_HEIGHT_RANGE[name]
         ids = [11, 12, 23, 24] if name == "torso_length" else [23, 24, 27, 28]
         reliable = bool(arms) if name == "arm_length" else min(front.visibility[ids]) > LANDMARK_VISIBILITY_MIN
         if not math.isfinite(value) or not bounds[0] <= value/height <= bounds[1] or not reliable:
             value, source = LENGTH_TO_HEIGHT[name]*height, "estimated"
             notes.append(f"{name.replace('_', ' ').title()} estimated from height: joint length is missing or implausible.")
-        if name == "inseam":
-            source = "estimated"
-            notes.append("Inseam is an estimated hip-midpoint-to-ankle proxy; Pose has no crotch landmark.")
         values[name] = metric(value, source)
     return values
 
 
 def measurement_confidence(height_source, torso, views, flagged=(), capture_warnings=()):
-    """Conservative quality tier, never a statistical accuracy score or high."""
+    """Conservative quality tier, capped at medium or low."""
     degraded = (height_source != "measured" or bool(flagged) or bool(capture_warnings)
                 or any(torso[name]["source"] != "measured" for name in ("chest", "waist", "hips"))
                 or any({"top", "bottom"}.intersection(v.touched_edges) for v in views))
     return "low" if degraded else "medium"
 
 
-# Broad engineering screening ranges, not population norms or diagnostic limits.
-# Each row: male cm range, female cm range, measurement / stature range.
 PLAUSIBILITY = {
-    "neck": ((25, 60), (23, 55), (.13, .32)),
-    "chest": ((55, 180), (50, 180), (.30, 1.05)),
-    "waist": ((40, 180), (40, 180), (.23, 1.05)),
-    "hips": ((55, 190), (50, 190), (.30, 1.15)),
-    "thigh": ((25, 100), (23, 100), (.14, .55)),
-    "wrist": ((12, 30), (10, 28), (.06, .16)),
-    "shoulder_width": ((25, 65), (23, 60), (.15, .34)),
+    "neck": ((25, 50), (23, 48), (.13, .30)),
+    "chest": ((65, 140), (60, 135), (.35, .90)),
+    "waist": ((55, 130), (50, 125), (.28, .85)),
+    "hips": ((65, 140), (60, 140), (.35, .95)),
+    "thigh": ((35, 85), (32, 85), (.18, .50)),
+    "wrist": ((12, 25), (10, 24), (.06, .15)),
+    "shoulder_width": ((35, 65), (32, 60), (.18, .34)),
     "torso_length": ((25, 80), (23, 75), (.16, .42)),
-    "arm_length": ((30, 100), (28, 95), (.18, .55)),
-    "inseam": ((40, 120), (35, 115), (.23, .65)),
+    "arm_length": ((40, 95), (38, 90), (.22, .52)),
+    "inseam": ((50, 110), (45, 105), (.28, .62)),
 }
 
 
@@ -470,6 +783,59 @@ def sanity_checks(height, measurements, gender, notes):
                 value["source"] = "estimated"
                 flagged.append(name)
                 notes.append(f"Implausible {name.replace('_', ' ')}: {cm} cm is outside the {gender} screening range ({lower}-{upper} cm) or height-relative range ({relative[0]:.2f}-{relative[1]:.2f}). Retake or verify with a tape measure.")
+    return flagged
+
+
+def enforce_plausibility_guards(measurements, height, gender, deltoid_cm, notes):
+    """Fix 5: Re-estimate any measurement that violates physical screening bounds with fallback."""
+    flagged = []
+    for group_name, group in measurements.items():
+        for name, val in group.items():
+            cm = val.get("cm")
+            if cm is None or not math.isfinite(cm):
+                continue
+            male, female, relative = PLAUSIBILITY[name]
+            lower, upper = male if gender == "male" else female
+            rel_lo, rel_hi = relative
+
+            tripped = not (lower <= cm <= upper and rel_lo <= cm / height <= rel_hi)
+            if name == "waist" and measurements["torso"]["hips"]["cm"] is not None:
+                hip_cm = measurements["torso"]["hips"]["cm"]
+                if cm > hip_cm * 1.10:
+                    tripped = True
+
+            if tripped:
+                flagged.append(name)
+                old_cm = cm
+                if name == "neck":
+                    new_cm = (0.22 if gender == "male" else 0.20) * height
+                elif name == "chest":
+                    new_cm = TORSO_WIDTH_TO_DELTOID["chest"] * deltoid_cm * 2.3
+                elif name == "waist":
+                    hip_cm = measurements["torso"]["hips"]["cm"] or (0.58 * height)
+                    new_cm = min(old_cm, hip_cm * 0.88)
+                elif name == "hips":
+                    new_cm = (0.58 if gender == "male" else 0.62) * height
+                elif name == "shoulder_width":
+                    new_cm = DELTOID_TO_HEIGHT_RATIO[gender] * height
+                elif name == "thigh":
+                    new_cm = THIGH_TO_HEIGHT_RATIO[gender] * height
+                elif name == "inseam":
+                    new_cm = 0.45 * height
+                elif name == "arm_length":
+                    new_cm = 0.34 * height
+                elif name == "wrist":
+                    new_cm = WRIST_TO_HEIGHT_RATIO[gender] * height
+                else:
+                    new_cm = old_cm
+
+                val["cm"] = round(new_cm, 1)
+                val["in"] = round(new_cm / 2.54, 1)
+                val["source"] = "estimated"
+                notes.append(
+                    f"Implausible {name.replace('_', ' ')} ({old_cm:.1f} cm) tripped screening range ({lower}-{upper} cm); "
+                    f"re-estimated as {new_cm:.1f} cm using anatomical fallback."
+                )
     return flagged
 
 
@@ -517,7 +883,6 @@ def debug_overlay(view):
         cv2.line(canvas, p, q, color, 2)
         cv2.circle(canvas, p, 3, color, -1)
         cv2.circle(canvas, q, 3, color, -1)
-        # Numbered legend prevents nearby neck/chest/thigh labels overlapping.
         cv2.putText(canvas, str(number+1), (p[0], int(np.clip(p[1]-5, 12, h-1))), cv2.FONT_HERSHEY_SIMPLEX, .4, color, 1)
     legend = np.full((max(h, 40+24*len(view.traces)), 390, 3), 245, np.uint8)
     cv2.putText(legend, f"{view.name}: observed -> used cm", (10, 22), cv2.FONT_HERSHEY_SIMPLEX, .5, (30, 30, 30), 1)
@@ -563,14 +928,23 @@ def measure(front_image, side_image, gender, options=None):
                     "legs": {"inseam": lengths["inseam"], "thigh": thigh_measurement(front, side, height, gender, height_source, notes)}}
     if not ADULT_HEIGHT_RANGE_CM[0] <= height <= ADULT_HEIGHT_RANGE_CM[1]:
         notes.append("Height is outside the broad adult plausibility range.")
+
     flagged = sanity_checks(height, measurements, gender, notes)
+    flagged += enforce_plausibility_guards(measurements, height, gender, deltoid, notes)
+
     notes.append("Measured means user-supplied height or image-derived geometry scaled by it, not a validated tape measurement. Estimated values use priors or uncertain geometry. Clothing, hair and perspective can cause substantial error.")
-    result = {"status": "ok", "height": metric(height, height_source), "measurements": measurements,
+    
+    height_meta = getattr(front, "scale_meta", {}) or {}
+    h_dict = metric(height, height_source)
+    if known_height is None and "uncertainty_cm" in height_meta:
+        h_dict["uncertainty_cm"] = height_meta["uncertainty_cm"]
+        h_dict["uncertainty_band"] = height_meta["uncertainty_band"]
+        h_dict["cues_used"] = height_meta["cues_used"]
+
+    result = {"status": "ok", "height": h_dict, "measurements": measurements,
               "confidence": measurement_confidence(height_source, torso, (front, side), flagged, capture_notes),
               "scale_anchor": "user_height" if known_height is not None else "head_prior" if height_source == "estimated" else "adult_baseline",
               "warnings": list(dict.fromkeys(notes))}
     if options.get("debug", False):
         result["debug"] = {view.name: debug_overlay(view) for view in (front, side)}
     return result
-
-
