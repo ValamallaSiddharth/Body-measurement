@@ -1,0 +1,7 @@
+set_id,arm_circumference_cm,arm_length_cm,calf_circumference_cm,chest_circumference_cm,front_build_cm,hips_circumference_cm,pelvis_circumference_cm,thigh_circumference_cm,under_chest_circumference_cm,upper_arm_length_cm,waist_circumference_cm,height,weight,age,gender,race,profession
+1,28,56,35,91,31,93,96,60,75,35,72,162,59,28,female,caucasian,Intermediate_prof
+2,37,65,42,110,38.0_tbr,103,105,60,101,33,99,184,93,30,male,caucasian,Manual
+3,24,56,33,83,33,81,87,48,77,30,73,175,55,18,male,indian,Others
+4,25,58,33,86.0_tbr,34.0_tbr,80,96,55,72,30,77,172,58,36,female,black,Employees
+5,25,55,34,90,32.0_tbr,76,101,56,79,29,73,165,60,37,female,caucasian,Executives
+6,26,66,34,90,39,84,92,48,78,32,70,176,60,18,male,black,Others

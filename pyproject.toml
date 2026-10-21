@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "two-photo-bodymeasure"
+version = "0.2.0"
+description = "Uncalibrated two-photo adult body measurement estimates"
+requires-python = ">=3.10,<3.13"
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = {file = ["requirements.txt"]}
+
+[tool.setuptools.packages.find]
+include = ["bodymeasure*"]
+
+[project.scripts]
+bodymeasure = "bodymeasure.cli:main"

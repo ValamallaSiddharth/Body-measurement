@@ -1,14 +1,13 @@
-fastapi==0.116.1
-uvicorn[standard]==0.35.0
-python-multipart==0.0.20
-sqlalchemy==2.0.43
-psycopg[binary]==3.2.9
-pydantic-settings==2.10.1
-mediapipe==0.10.21
-# MediaPipe 0.10.21 depends on this flavor; install ONLY one cv2 distribution.
-# The Docker image includes its runtime libraries; no GUI is used by the app.
-opencv-contrib-python==4.11.0.86
+# Python 3.11; this MediaPipe release retains the bundled Solutions models.
+Flask==3.1.0
+flask-cors==5.0.1
 numpy==1.26.4
-protobuf==4.25.5
-Pillow==11.3.0
-httpx==0.28.1
+mediapipe==0.10.21
+opencv-python-headless==4.11.0.86
+# Required transitively by MediaPipe; keep its cv2 version identical.
+opencv-contrib-python==4.11.0.86
+Pillow==11.1.0
+jax==0.4.35
+jaxlib==0.4.35
+scipy==1.14.1
+protobuf==4.25.6

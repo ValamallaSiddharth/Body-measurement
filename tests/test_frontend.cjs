@@ -1,33 +1,110 @@
-/* Run with node tests/test_frontend.cjs; no browser dependencies required. */
-const fs=require('fs'),vm=require('vm'),assert=require('assert');
-const html=fs.readFileSync('app/static/index.html','utf8');
-class Element {
-  constructor(){this.value='';this.textContent='';this.hidden=false;this.children=[];this.events={};this.files=[];}
-  addEventListener(n,f){this.events[n]=f;} appendChild(x){this.children.push(x);} replaceChildren(){this.children=[];}
-  querySelectorAll(){return [];} scrollIntoView(){} focus(){} reset(){} removeAttribute(){}
-}
-const nodes=new Map([...html.matchAll(/id="([^"]+)"/g)].map(m=>[m[1],new Element()]));
-let mode='success';
-nodes.get('mode').value='demo';
-const response={person_id:'P001',measurements:{height_cm:170,shoulder_cm:40,waist_cm:85,front_waist_width_cm:32,side_waist_depth_cm:22},confidence:.91,status:'good',created_at:'2026-09-21T12:00:00Z',notes:'Estimate'};
-const context={document:{getElementById(id){assert(nodes.has(id),id);return nodes.get(id);},createElement(){return new Element();}},URL:{createObjectURL(){return 'blob:test';},revokeObjectURL(){}},FormData:class{append(){}},fetch:async url=>['/api/measure','/api/demo/measure'].includes(url)?{ok:mode==='success',status:mode==='success'?200:409,json:async()=>mode==='success'?{...response,mode:url.includes('/demo/')?'demo':'real'}:{error:'This Person ID already has a saved measurement.'}}:{ok:true,json:async()=>url==='/health'?{ok:true}:[]}};
-vm.runInNewContext(fs.readFileSync('app/static/app.js','utf8'),context);
-const $=id=>nodes.get(id);
-(async()=>{
- await $('measurement-form').events.submit({preventDefault(){}});assert($('error').textContent);
- $('person-id').value='P001';
- await $('measurement-form').events.submit({preventDefault(){}});
- assert.equal($('result-status').textContent,'DEMO ONLY');assert.equal($('result-demo-notice').hidden,false);
- $('mode').value='real';$('mode').events.change();
- assert.equal($('real-instructions').hidden,false);
- await $('measurement-form').events.submit({preventDefault(){}});assert($('error').textContent.includes('Select both'));
- for(const view of ['front','side']){$(view+'-file').files=[{name:view+'.jpg',size:2000}];$(view+'-file').events.change({target:$(view+'-file')});assert.equal($(view+'-preview').hidden,false);}
- await $('measurement-form').events.submit({preventDefault(){}});
- assert.equal($('height-value').textContent,'170.0 cm');assert.equal($('result-status').textContent,'GOOD');assert.equal($('result').hidden,false);assert.equal($('processing').hidden,true);
- mode='duplicate';await $('measurement-form').events.submit({preventDefault(){}});assert($('error').textContent.includes('already has'));assert.equal($('result').hidden,true);
- $('another').events.click();assert.equal($('front-preview').hidden,true);
- $('front-file').files=[{name:'bad.heic',size:2000}];$('front-file').events.change({target:$('front-file')});assert($('error').textContent.includes('HEIC'));
- assert(!html.includes('name="height_cm"'));
- console.log('PASS: frontend wiring, previews, validation, results, duplicate errors, reset, and unsupported images');
-})().catch(error=>{console.error(error);process.exitCode=1;});
+// Dependency-free behavioral checks for the actual inline page script.
+const fs = require('node:fs');
+const vm = require('node:vm');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
+function setup(fetchImpl, protocol = 'http:') {
+  const elements = new Map();
+  function element(id) {
+    return { id, hidden: false, disabled: false, textContent: '', children: [], files: [],
+      handlers: {}, attrs: {}, naturalWidth: 400, naturalHeight: 800,
+      addEventListener(name, fn) { this.handlers[name] = fn; },
+      append(child) { this.children.push(child); },
+      replaceChildren() { this.children = []; },
+      setAttribute(key, value) { this.attrs[key] = value; },
+      removeAttribute(key) { delete this.attrs[key]; },
+      async decode() {}
+    };
+  }
+  const document = {
+    getElementById(id) { if (!elements.has(id)) elements.set(id, element(id)); return elements.get(id); },
+    createElement(tag) { return element(tag); }
+  };
+  let timeoutCallback, cleared = false;
+  const context = {
+    document, window: {}, location: { protocol }, fetch: fetchImpl,
+    AbortController, FormData: class {}, URL: { createObjectURL: () => 'blob:test', revokeObjectURL() {} },
+    setTimeout(callback) { timeoutCallback = callback; return 1; },
+    clearTimeout() { cleared = true; }
+  };
+  vm.runInNewContext(script, context, { filename: 'index.html inline script' });
+  for (const view of ['front', 'side']) document.getElementById(view).files = [{ name: `${view}.jpg`, size: 1000 }];
+  return { get: id => document.getElementById(id), timeout: () => timeoutCallback(),
+    cleared: () => cleared,
+    submit: () => document.getElementById('measure-form').handlers.submit({ preventDefault() {} }) };
+}
+
+const result = {
+  status: 'ok', height: { cm: 175, in: 68.9 }, confidence: 'low',
+  measurements: {
+    head_neck: { neck: { cm: 35, in: 13.8 } },
+    torso: { chest: { cm: 90, in: 35.4 } },
+    arms: { wrist: { cm: null, in: null } }, legs: {}
+  }, warnings: ['<script>must be rendered as text</script>']
+};
+const reply = (ok, status, body) => ({ ok, status, text: async () => body });
+
+(async () => {
+  let release;
+  const ui = setup((url, request) => {
+    assert.equal(url, '/measure');
+    assert.equal(request.method, 'POST');
+    assert.ok(request.signal);
+    return new Promise(resolve => { release = resolve; });
+  });
+  const pending = ui.submit();
+  assert.equal(ui.get('measure').disabled, true);
+  assert.equal(ui.get('progress').hidden, false);
+  release(reply(true, 200, JSON.stringify(result)));
+  await pending;
+  assert.equal(ui.get('results').hidden, false);
+  assert.equal(ui.get('height').textContent, '175.0 cm / 68.9 in');
+  assert.equal(ui.get('measurement-rows').children.length, 14);
+  assert.equal(ui.get('warning-list').children[0].textContent, result.warnings[0]);
+  assert.equal(ui.get('measure').disabled, false);
+  assert.equal(ui.get('progress').hidden, true);
+  assert.ok(ui.cleared());
+
+  const scenarios = [
+    [async () => { throw new TypeError('Failed to fetch'); }, /Cannot reach/],
+    [async () => reply(false, 422, JSON.stringify({ error: 'No person detected in front image.' })), /No person/],
+    [async () => reply(false, 502, '<html>proxy error</html>'), /HTTP 502/],
+    [async () => reply(true, 200, '<html>wrong server</html>'), /non-JSON/],
+    [async () => reply(true, 200, '{}'), /unexpected result/]
+  ];
+  for (const [fetchImpl, message] of scenarios) {
+    const failed = setup(fetchImpl);
+    await failed.submit();
+    assert.match(failed.get('error').textContent, message);
+    assert.equal(failed.get('error').hidden, false);
+    assert.equal(failed.get('measure').disabled, false);
+    assert.equal(failed.get('progress').hidden, true);
+    assert.equal(failed.get('results').hidden, true);
+    assert.ok(failed.cleared());
+  }
+  const timed = setup((url, options) => new Promise((resolve, reject) => {
+    options.signal.addEventListener('abort', () => {
+      const error = new Error('abort'); error.name = 'AbortError'; reject(error);
+    });
+  }));
+  const timedRequest = timed.submit(); timed.timeout(); await timedRequest;
+  assert.match(timed.get('error').textContent, /timed out/);
+  assert.equal(timed.get('measure').disabled, false);
+
+  const local = setup(() => assert.fail('file:// should be rejected'), 'file:');
+  await local.submit(); assert.match(local.get('error').textContent, /http:\/\/127.0.0.1:5000/);
+
+  const preview = setup(() => {});
+  const input = preview.get('front');
+  await input.handlers.change({ target: input });
+  assert.equal(preview.get('front-preview').src, 'blob:test');
+  assert.equal(preview.get('front-preview').hidden, false);
+  input.files = [{ name: 'bad.exe', size: 200 }];
+  await input.handlers.change({ target: input });
+  assert.match(preview.get('error').textContent, /JPG, PNG or WebP/);
+  assert.equal(input.value, '');
+  console.log('Frontend: 10 scenarios passed (success, 5 error responses, timeout, file origin, valid/invalid previews).');
+})().catch(error => { console.error(error); process.exitCode = 1; });

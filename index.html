@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Body measurements · Two photos</title>
+  <style>
+    :root { color-scheme: light; font-family: system-ui, sans-serif; color: #18312d; background: #eef3ef; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 36px 18px; }
+    main { max-width: 850px; margin: auto; }
+    header { margin-bottom: 28px; }
+    h1 { font-size: clamp(1.9rem, 5vw, 2.8rem); margin: 8px 0; letter-spacing: -.04em; }
+    h2 { margin-top: 0; }
+    .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; color: #367669; }
+    p { line-height: 1.6; }
+    .muted { color: #566a63; }
+    .card { padding: 26px; background: white; border: 1px solid #d5e1d9; border-radius: 18px; margin-bottom: 22px; }
+    .photos { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    label { display: block; font-weight: 650; margin-bottom: 10px; }
+    input, select, button { font: inherit; max-width: 100%; }
+    input[type=file] { width: 100%; font-size: .86rem; }
+    input::file-selector-button { background: #e9f2ed; border: 0; padding: 10px; border-radius: 8px; cursor: pointer; margin-right: 8px; }
+    .preview { margin-top: 14px; height: 230px; background: #f4f7f4; border: 1px dashed #c4d4ca; border-radius: 10px; display: grid; place-items: center; overflow: hidden; }
+    .preview img { width: 100%; height: 230px; object-fit: contain; }
+    .preview span { color: #6a7b72; font-size: .9rem; }
+    .controls { display: flex; gap: 20px; align-items: end; margin-top: 24px; }
+    select { min-width: 150px; padding: 11px; border: 1px solid #b7c8bd; border-radius: 8px; background: white; }
+    button { padding: 13px 30px; background: #17634f; color: white; border: 0; border-radius: 9px; font-weight: 650; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    :focus-visible { outline: 3px solid #c58326; outline-offset: 3px; }
+    #progress { margin: 18px 0 0; }
+    .spinner { display: inline-block; border: 2px solid #bccfc2; border-top-color: #17634f; width: 16px; height: 16px; border-radius: 50%; animation: spin 1s linear infinite; vertical-align: middle; margin-right: 8px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #error { color: #8c2424; background: #fff1ef; border: 1px solid #edc3bd; padding: 16px; border-radius: 9px; margin-bottom: 20px; }
+    .height { font-size: 2rem; font-weight: 700; margin: 8px 0; }
+    table { width: 100%; border-collapse: collapse; margin-top: 22px; }
+    th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e1e8e3; }
+    th:not(:first-child), td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
+    .group th { background: #edf4ef; font-size: .8rem; letter-spacing: .04em; text-transform: uppercase; }
+    #warnings { background: #fff8e8; padding: 18px; border-radius: 10px; margin-top: 24px; }
+    #warnings h3 { margin: 0; }
+    li { line-height: 1.55; margin: 8px 0; }
+    [hidden] { display: none !important; }
+    @media (max-width: 520px) { .photos { grid-template-columns: 1fr; } .card { padding: 18px; } .controls { align-items: stretch; flex-direction: column; } }
+    @media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+  </style>
+</head>
+<body>
+<main>
+  <header>
+    <span class="eyebrow">Two photos · An approximate fit</span>
+    <h1>Body measurements</h1>
+    <p class="muted">Upload a front and side photo to estimate your measurements. No height entry needed. Photos are processed in memory and are not saved by the app.</p>
+  </header>
+  <form id="measure-form" class="card">
+    <div class="photos">
+      <div>
+        <label for="front">Front image</label>
+        <input id="front" name="front_image" type="file" accept="image/jpeg,image/png,image/webp" required aria-describedby="photo-help">
+        <div class="preview"><span id="front-placeholder">Face the camera</span><img id="front-preview" alt="Selected front photo" hidden></div>
+      </div>
+      <div>
+        <label for="side">Side image</label>
+        <input id="side" name="side_image" type="file" accept="image/jpeg,image/png,image/webp" required aria-describedby="photo-help">
+        <div class="preview"><span id="side-placeholder">Turn 90° to the camera</span><img id="side-preview" alt="Selected side photo" hidden></div>
+      </div>
+    </div>
+    <p id="photo-help" class="muted">JPG, PNG or WebP · Up to 12 MB and 20 megapixels each. Include your whole body with space around head and feet. Use fitted clothing and a plain background. Keep arms away from your torso; in the side photo, hold them slightly forward.</p>
+    <div class="controls">
+      <div><label for="gender">Gender</label><select id="gender" name="gender"><option value="male">Male</option><option value="female">Female</option></select></div>
+      <button id="measure" type="submit">Measure</button>
+    </div>
+    <p id="progress" role="status" hidden><span class="spinner" aria-hidden="true"></span>Processing both photos… This may take a moment.</p>
+  </form>
+  <div id="error" role="alert" hidden></div>
+  <section id="results" class="card" aria-labelledby="results-title" hidden>
+    <h2 id="results-title">Your estimated measurements</h2>
+    <div class="muted">Estimated height</div>
+    <p id="height" class="height"></p>
+    <p id="confidence" class="muted"></p>
+    <table><thead><tr><th scope="col">Measurement</th><th scope="col">cm</th><th scope="col">inches</th></tr></thead><tbody id="measurement-rows"></tbody></table>
+    <div id="warnings"><h3>Accuracy & capture notes</h3><ul id="warning-list"></ul></div>
+  </section>
+  <p class="muted">These estimates use adult head-size proportions and can be substantially wrong. They are not suitable for medical decisions or precise tailoring.</p>
+</main>
+<script>
+  // Default: backend serves this page and /measure on the same origin.
+  // For a separately hosted UI, set window.API_BASE_URL before this script,
+  // or replace the empty string with e.g. "http://127.0.0.1:5000".
+  const API_BASE_URL = (window.API_BASE_URL || '').replace(/\/+$/, '');
+  const REQUEST_TIMEOUT_MS = 120000;
+  const form = document.getElementById('measure-form');
+  const button = document.getElementById('measure');
+  const errorBox = document.getElementById('error');
+  const results = document.getElementById('results');
+  const progress = document.getElementById('progress');
+  const previewUrls = {};
+  function showError(message) { errorBox.textContent = message; errorBox.hidden = false; }
+  function validateFile(file, label) {
+    if (!file) throw new Error(`Choose the ${label} image.`);
+    if (!/\.(jpe?g|png|webp)$/i.test(file.name)) throw new Error(`${label} image must be JPG, PNG or WebP.`);
+    if (file.size > 12 * 1024 * 1024) throw new Error(`${label} image exceeds the 12 MB limit.`);
+    if (file.size === 0) throw new Error(`${label} image is empty.`);
+  }
+  for (const view of ['front', 'side']) {
+    document.getElementById(view).addEventListener('change', async event => {
+      errorBox.hidden = true;
+      results.hidden = true;
+      const preview = document.getElementById(`${view}-preview`);
+      const placeholder = document.getElementById(`${view}-placeholder`);
+      preview.hidden = true;
+      placeholder.hidden = false;
+      if (previewUrls[view]) URL.revokeObjectURL(previewUrls[view]);
+      if (!event.target.files.length) return;
+      try {
+        const file = event.target.files[0];
+        validateFile(file, view);
+        previewUrls[view] = URL.createObjectURL(file);
+        preview.src = previewUrls[view];
+        await preview.decode();
+        if (preview.naturalWidth * preview.naturalHeight > 20000000) throw new Error(`${view} image exceeds 20 megapixels.`);
+        preview.hidden = false;
+        placeholder.hidden = true;
+      } catch (error) {
+        event.target.value = '';
+        showError(error.message || `Cannot preview the ${view} image. Choose a valid photo.`);
+      }
+    });
+  }
+  function renderResults(data) {
+    if (data?.status !== 'ok' || !data.height || !data.measurements || !Array.isArray(data.warnings)) {
+      throw new Error('The server returned an unexpected result. Check that API_BASE_URL points to this app.');
+    }
+    const number = value => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(1) : 'Unavailable';
+    document.getElementById('height').textContent = `${number(data.height.cm)} cm / ${number(data.height.in)} in`;
+    document.getElementById('confidence').textContent = `Heuristic confidence: ${data.confidence || 'low'} · Not a statistical accuracy score`;
+    const rows = document.getElementById('measurement-rows');
+    rows.replaceChildren();
+    const groups = [
+      ['head_neck', 'Head/Neck', [['neck', 'Neck']]],
+      ['torso', 'Torso', [['shoulder_width', 'Shoulder width'], ['chest', 'Chest'], ['waist', 'Waist'], ['hips', 'Hips'], ['torso_length', 'Torso length']]],
+      ['arms', 'Arms', [['arm_length', 'Arm length'], ['wrist', 'Wrist']]],
+      ['legs', 'Legs', [['inseam', 'Inseam (joint proxy)'], ['thigh', 'Thigh']]]
+    ];
+    for (const [key, title, fields] of groups) {
+      const header = document.createElement('tr'); header.className = 'group';
+      const cell = document.createElement('th'); cell.colSpan = 3; cell.scope = 'rowgroup'; cell.textContent = title;
+      header.append(cell); rows.append(header);
+      for (const [field, label] of fields) {
+        const value = data.measurements[key]?.[field];
+        const row = document.createElement('tr');
+        for (const text of [label, number(value?.cm), number(value?.in)]) {
+          const td = document.createElement('td'); td.textContent = text; row.append(td);
+        }
+        rows.append(row);
+      }
+    }
+    const warnings = document.getElementById('warning-list'); warnings.replaceChildren();
+    for (const warning of data.warnings) {
+      const li = document.createElement('li'); li.textContent = String(warning); warnings.append(li);
+    }
+    results.hidden = false;
+  }
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    errorBox.hidden = true; results.hidden = true;
+    let timer;
+    try {
+      if (location.protocol === 'file:' && !API_BASE_URL) throw new Error('Open http://127.0.0.1:5000 after starting python app.py. This page must be served by the backend.');
+      for (const view of ['front', 'side']) validateFile(document.getElementById(view).files[0], view);
+      const body = new FormData(form);
+      button.disabled = true; progress.hidden = false; form.setAttribute('aria-busy', 'true');
+      for (const id of ['front', 'side', 'gender']) document.getElementById(id).disabled = true;
+      const controller = new AbortController();
+      timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+      let response, text;
+      try {
+        response = await fetch(`${API_BASE_URL}/measure`, { method: 'POST', body, signal: controller.signal });
+        text = await response.text();
+      } catch (error) {
+        if (error.name === 'AbortError') throw new Error('Processing timed out after 120 seconds. Try smaller photos or retry shortly.');
+        throw new Error('Cannot reach the measurement server. Start python app.py, open its URL, and check API_BASE_URL and your network connection.');
+      }
+      let data;
+      try { data = JSON.parse(text); } catch (_) { data = null; }
+      if (!response.ok) {
+        const message = typeof data?.error === 'string' ? data.error : `The server returned HTTP ${response.status} without a JSON error. Check the backend logs or API URL.`;
+        throw new Error(message);
+      }
+      if (!data) throw new Error('The server returned a non-JSON response. Check API_BASE_URL and the backend logs.');
+      renderResults(data);
+    } catch (error) {
+      showError(error.message || 'The measurement could not be completed. Please retry.');
+    } finally {
+      clearTimeout(timer); button.disabled = false; progress.hidden = true; form.removeAttribute('aria-busy');
+      for (const id of ['front', 'side', 'gender']) document.getElementById(id).disabled = false;
+    }
+  });
+</script>
+</body>
+</html>
