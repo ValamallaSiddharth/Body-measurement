@@ -3,7 +3,9 @@ import argparse
 import json
 from pathlib import Path
 from werkzeug.datastructures import FileStorage
-from .pipeline import CaptureError, run_pipeline
+from . import pipeline
+from .errors import CaptureError
+from .validation import validate_upload
 
 
 def main(argv=None):
@@ -11,15 +13,14 @@ def main(argv=None):
     parser.add_argument("--front", required=True)
     parser.add_argument("--side", required=True)
     parser.add_argument("--gender", required=True, choices=("male", "female"))
+    parser.add_argument("--height-cm", type=float, help="Known adult height in cm (120-220)")
     args = parser.parse_args(argv)
-    # Deferred import keeps the package pipeline independent of Flask startup.
-    from app import validate_upload
     try:
         images = []
         for view, filename in (("front", args.front), ("side", args.side)):
             with open(filename, "rb") as stream:
                 images.append(validate_upload(FileStorage(stream=stream, filename=Path(filename).name), view))
-        print(json.dumps(run_pipeline(*images, args.gender), indent=2))
+        print(json.dumps(pipeline.measure(*images, args.gender, {"height_cm": args.height_cm}), indent=2))
         return 0
     except (CaptureError, OSError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}))

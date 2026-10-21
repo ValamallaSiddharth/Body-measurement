@@ -15,6 +15,9 @@
     .eyebrow { text-transform: uppercase; letter-spacing: .14em; font-size: .75rem; font-weight: 700; color: #367669; }
     p { line-height: 1.6; }
     .muted { color: #566a63; }
+    .source { display: inline-block; font-size: .72rem; font-weight: 500; border: 1px solid #b7c8bd; border-radius: 5px; padding: 2px 5px; margin-left: 5px; vertical-align: middle; }
+    input[type=number] { width: 160px; padding: 11px; border: 1px solid #b7c8bd; border-radius: 8px; }
+    .controls { flex-wrap: wrap; }
     .card { padding: 26px; background: white; border: 1px solid #d5e1d9; border-radius: 18px; margin-bottom: 22px; }
     .photos { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
     label { display: block; font-weight: 650; margin-bottom: 10px; }
@@ -69,8 +72,10 @@
     <p id="photo-help" class="muted">JPG, PNG or WebP · Up to 12 MB and 20 megapixels each. Include your whole body with space around head and feet. Use fitted clothing and a plain background. Keep arms away from your torso; in the side photo, hold them slightly forward.</p>
     <div class="controls">
       <div><label for="gender">Gender</label><select id="gender" name="gender"><option value="male">Male</option><option value="female">Female</option></select></div>
+      <div><label for="height-cm">Known height (optional, cm)</label><input id="height-cm" name="height_cm" type="number" min="120" max="220" step="0.1" placeholder="e.g. 175" aria-describedby="height-help"></div>
       <button id="measure" type="submit">Measure</button>
     </div>
+    <p id="height-help" class="muted">A known height improves scale. Leave blank to use approximate adult head proportions.</p>
     <p id="progress" role="status" hidden><span class="spinner" aria-hidden="true"></span>Processing both photos… This may take a moment.</p>
   </form>
   <div id="error" role="alert" hidden></div>
@@ -96,6 +101,20 @@
   const results = document.getElementById('results');
   const progress = document.getElementById('progress');
   const previewUrls = {};
+  const sourceHelp = {
+    measured: 'User-supplied height, or image geometry scaled using that height. Not a validated tape measurement.',
+    estimated: 'Uses adult proportions, uncertain image geometry, or a value flagged by plausibility checks.',
+    assumed: 'Fixed adult baseline used because a reliable scale anchor is unavailable.'
+  };
+  function sourceBadge(source) {
+    const badge = document.createElement('span');
+    badge.className = 'source';
+    badge.textContent = sourceHelp[source] ? source : 'estimated';
+    badge.setAttribute('title', sourceHelp[badge.textContent]);
+    badge.setAttribute('tabindex', '0');
+    badge.setAttribute('aria-label', `${badge.textContent}: ${sourceHelp[badge.textContent]}`);
+    return badge;
+  }
   function showError(message) { errorBox.textContent = message; errorBox.hidden = false; }
   function validateFile(file, label) {
     if (!file) throw new Error(`Choose the ${label} image.`);
@@ -134,6 +153,7 @@
     }
     const number = value => typeof value === 'number' && Number.isFinite(value) ? value.toFixed(1) : 'Unavailable';
     document.getElementById('height').textContent = `${number(data.height.cm)} cm / ${number(data.height.in)} in`;
+    document.getElementById('height').append(sourceBadge(data.height.source));
     document.getElementById('confidence').textContent = `Heuristic confidence: ${data.confidence || 'low'} · Not a statistical accuracy score`;
     const rows = document.getElementById('measurement-rows');
     rows.replaceChildren();
@@ -150,8 +170,10 @@
       for (const [field, label] of fields) {
         const value = data.measurements[key]?.[field];
         const row = document.createElement('tr');
-        for (const text of [label, number(value?.cm), number(value?.in)]) {
-          const td = document.createElement('td'); td.textContent = text; row.append(td);
+        for (const [index, text] of [label, number(value?.cm), number(value?.in)].entries()) {
+          const td = document.createElement('td'); td.textContent = text;
+          if (index > 0) td.append(sourceBadge(value?.source));
+          row.append(td);
         }
         rows.append(row);
       }
@@ -169,9 +191,11 @@
     try {
       if (location.protocol === 'file:' && !API_BASE_URL) throw new Error('Open http://127.0.0.1:5000 after starting python app.py. This page must be served by the backend.');
       for (const view of ['front', 'side']) validateFile(document.getElementById(view).files[0], view);
+      const height = document.getElementById('height-cm').value;
+      if (height && (!Number.isFinite(Number(height)) || Number(height) < 120 || Number(height) > 220)) throw new Error('Known adult height must be between 120 and 220 cm.');
       const body = new FormData(form);
       button.disabled = true; progress.hidden = false; form.setAttribute('aria-busy', 'true');
-      for (const id of ['front', 'side', 'gender']) document.getElementById(id).disabled = true;
+      for (const id of ['front', 'side', 'gender', 'height-cm']) document.getElementById(id).disabled = true;
       const controller = new AbortController();
       timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
       let response, text;
@@ -194,7 +218,7 @@
       showError(error.message || 'The measurement could not be completed. Please retry.');
     } finally {
       clearTimeout(timer); button.disabled = false; progress.hidden = true; form.removeAttribute('aria-busy');
-      for (const id of ['front', 'side', 'gender']) document.getElementById(id).disabled = false;
+      for (const id of ['front', 'side', 'gender', 'height-cm']) document.getElementById(id).disabled = false;
     }
   });
 </script>
