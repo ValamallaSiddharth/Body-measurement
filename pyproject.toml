@@ -4,9 +4,10 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "two-photo-bodymeasure"
-version = "0.2.0"
+version = "0.3.0"
 description = "Uncalibrated two-photo adult body measurement estimates"
-requires-python = ">=3.10,<3.13"
+requires-python = ">=3.11,<3.12"
+readme = "README.md"
 dynamic = ["dependencies"]
 
 [tool.setuptools.dynamic]
@@ -17,3 +18,26 @@ include = ["bodymeasure*"]
 
 [project.scripts]
 bodymeasure = "bodymeasure.cli:main"
+bodymeasure-server = "bodymeasure.web:main"
+
+[tool.setuptools.package-data]
+bodymeasure = ["templates/*.html"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10", "build>=1,<2", "ruff>=0.11,<1"]
+server = ["gunicorn>=23,<26; sys_platform != 'win32'"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
+
+[tool.ruff.lint.per-file-ignores]
+"scripts/evaluate.py" = ["E402"]
+"tests/verify_http.py" = ["E402"]

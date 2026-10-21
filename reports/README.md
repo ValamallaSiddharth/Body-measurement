@@ -1,5 +1,25 @@
 # Archived dataset evaluation
 
+## Observed sample results
+
+All six image pairs completed in both modes. Chest has five scored values because
+subject 4's `86.0_tbr` entry is excluded. MAE below is in centimetres:
+
+| Measurement | Uncalibrated MAE | Known-height MAE |
+| --- | ---: | ---: |
+| Height | 11.78 | Not scored (input) |
+| Arm length | 13.85 | 14.73 |
+| Chest | 6.66 | 4.72 |
+| Waist | 8.22 | 4.60 |
+| Hips | 17.68 | 15.73 |
+| Thigh | 16.12 | 14.80 |
+
+These results show substantial remaining error. Known height improves scale for
+some measurements but cannot resolve landmark definitions, clothing or silhouette
+geometry. See each mode's `summary.csv` for RMSE, bias and tolerance percentages.
+
+## Reproduction and assumptions
+
 Run from the checkout after installing the package:
 
 ```powershell

@@ -10,6 +10,11 @@ models/
 config.json
 calibration.json
 *.egg-info/
+.venv*/
+build/
+dist/
+.pytest_cache/
+.ruff_cache/
 archive/
 archive.zip
 *.task

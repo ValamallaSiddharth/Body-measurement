@@ -1,0 +1,5 @@
+include README.md LEGACY_ASSETS.md requirements.txt gunicorn.conf.py Dockerfile app.py
+recursive-include bodymeasure/templates *.html
+recursive-include scripts *.py
+recursive-include tests *.py *.cjs
+recursive-include reports *.md *.csv
