@@ -3,7 +3,7 @@ const fs = require('node:fs');
 const vm = require('node:vm');
 const assert = require('node:assert/strict');
 const path = require('node:path');
-const html = fs.readFileSync(path.join(__dirname, '..', 'index.html'), 'utf8');
+const html = fs.readFileSync(path.join(__dirname, '..', 'bodymeasure', 'templates', 'index.html'), 'utf8');
 const script = html.match(/<script>([\s\S]*?)<\/script>/)[1];
 
 function setup(fetchImpl, protocol = 'http:') {
@@ -38,7 +38,7 @@ function setup(fetchImpl, protocol = 'http:') {
 }
 
 const result = {
-  status: 'ok', height: { cm: 175, in: 68.9 }, confidence: 'low',
+  status: 'ok', height: { cm: 175, in: 68.9, source: 'measured' }, confidence: 'low',
   measurements: {
     head_neck: { neck: { cm: 35, in: 13.8 } },
     torso: { chest: { cm: 90, in: 35.4 } },
@@ -63,6 +63,13 @@ const reply = (ok, status, body) => ({ ok, status, text: async () => body });
   assert.equal(ui.get('results').hidden, false);
   assert.equal(ui.get('height').textContent, '175.0 cm / 68.9 in');
   assert.equal(ui.get('measurement-rows').children.length, 14);
+  assert.equal(ui.get('height').children[0].textContent, 'measured');
+  assert.match(ui.get('height').children[0].attrs.title, /User-supplied/);
+  assert.equal(ui.get('measurement-rows').children[1].children[1].children[0].textContent, 'estimated');
+  const invalidHeight = setup(() => assert.fail('invalid height must not submit'));
+  invalidHeight.get('height-cm').value = 'NaN';
+  await invalidHeight.submit();
+  assert.match(invalidHeight.get('error').textContent, /Known adult height/);
   assert.equal(ui.get('warning-list').children[0].textContent, result.warnings[0]);
   assert.equal(ui.get('measure').disabled, false);
   assert.equal(ui.get('progress').hidden, true);
@@ -106,5 +113,5 @@ const reply = (ok, status, body) => ({ ok, status, text: async () => body });
   await input.handlers.change({ target: input });
   assert.match(preview.get('error').textContent, /JPG, PNG or WebP/);
   assert.equal(input.value, '');
-  console.log('Frontend: 10 scenarios passed (success, 5 error responses, timeout, file origin, valid/invalid previews).');
+  console.log('Frontend: 11 scenarios passed, including source badges and height validation (success, 5 error responses, timeout, file origin, valid/invalid previews).');
 })().catch(error => { console.error(error); process.exitCode = 1; });

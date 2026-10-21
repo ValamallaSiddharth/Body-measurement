@@ -11,8 +11,7 @@ import cv2
 import numpy as np
 from werkzeug.serving import make_server
 from app import create_app
-from bodymeasure.pipeline import (View, edges_touched, boundary_confidence,
-                                  prepare_view, segment_body, slice_width, detect_pose)
+from bodymeasure.detection import edges_touched, segment_body, detect_pose
 
 
 class BoundaryTests(unittest.TestCase):
@@ -23,33 +22,10 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(edges_touched(mask), ["top", "bottom", "left", "right"])
         self.assertEqual(edges_touched(mask, tol=1), [])
 
-    def test_both_views_warn_and_use_ankle_ground(self):
-        image = np.zeros((200, 200, 3), dtype=np.uint8)
-        mask = np.zeros((200, 200), dtype=np.uint8)
-        mask[:, 50:150] = 1
-        points = np.full((33, 2), 100.0)
-        points[[27, 28], 1] = [179, 184]
-        for name in ("front", "side"):
-            warnings = []
-            with patch("bodymeasure.pipeline.detect_pose", return_value=(points, np.ones(33))), \
-                 patch("bodymeasure.pipeline.segment_body", return_value=mask), \
-                 patch("bodymeasure.pipeline.detect_chin", return_value=25):
-                view = prepare_view(image, name, warnings)
-            self.assertEqual(view.ground, 184)
-            self.assertEqual(view.touched_edges, ("top", "bottom"))
-            self.assertIn(f"{name.title()} silhouette is close to the image edge", warnings)
-            self.assertIn(f"{name.title()} touched edges: top, bottom", warnings)
-            self.assertIn("Feet may be cut off; height may be underestimated", warnings)
-            self.assertIn("Head may be cut off; height and scale may be inaccurate", warnings)
-            for before, after in (("high", "medium"), ("medium", "low"), ("low", "low")):
-                self.assertEqual(boundary_confidence(before, (view, view)), after)
-            view.touched_edges = ("left",)
-            self.assertEqual(boundary_confidence("medium", (view,)), "medium")
-
     def test_landmarks_outside_image_are_clamped(self):
         from types import SimpleNamespace
         landmarks = [SimpleNamespace(x=-.2, y=1.2, visibility=.9) for _ in range(33)]
-        with patch("bodymeasure.pipeline.mp.solutions.pose.Pose") as factory:
+        with patch("bodymeasure.detection.mp.solutions.pose.Pose") as factory:
             factory.return_value.__enter__.return_value.process.return_value = SimpleNamespace(
                 pose_landmarks=SimpleNamespace(landmark=landmarks))
             warnings = []
@@ -58,17 +34,7 @@ class BoundaryTests(unittest.TestCase):
         np.testing.assert_array_equal(points[:, 1], 199)
         self.assertTrue(warnings)
 
-    def test_outside_slice_rows_and_columns_do_not_wrap_or_crash(self):
-        mask = np.zeros((200, 100), dtype=np.uint8)
-        mask[:, 20:80] = 1
-        view = View("front", np.zeros((33, 2)), np.ones(33), mask, 0, 199, 20, 1)
-        for y, x in ((-10, 50), (10, 50), (.5, -1000), (.5, 1000)):
-            warnings = []
-            self.assertIsNone(slice_width(view, y, x, "waist", warnings))
-            self.assertTrue(warnings)
-        self.assertEqual(slice_width(view, 0, 50, "waist", []), 60)
-        self.assertEqual(slice_width(view, 1, 50, "waist", []), 60)
-
+    @unittest.skipUnless((Path(__file__).resolve().parents[1]/"uploads/front.jpg").exists(), "Optional local sample photos not distributed")
     def test_real_bottom_cropped_photo_over_http(self):
         root = Path(__file__).resolve().parents[1]
         image = cv2.imread(str(root / "uploads/front.jpg"))

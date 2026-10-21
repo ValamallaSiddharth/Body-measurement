@@ -5,7 +5,8 @@ from unittest.mock import patch
 import numpy as np
 from PIL import Image
 from werkzeug.datastructures import FileStorage
-from app import MAX_FILE_BYTES, MemoryRequest, create_app, validate_upload
+from bodymeasure.web import MemoryRequest, create_app
+from bodymeasure.validation import MAX_FILE_BYTES, validate_upload
 from bodymeasure.pipeline import CaptureError
 
 
@@ -58,12 +59,12 @@ class AppTests(unittest.TestCase):
         self.assertIn("No person", response.json["error"])
 
     def test_exception_returns_json_500_and_releases_slot(self):
-        with patch("app.run_pipeline", side_effect=RuntimeError("test failure")), self.assertLogs(self.app.logger, level="ERROR"):
+        with patch("bodymeasure.pipeline.measure", side_effect=RuntimeError("test failure")), self.assertLogs(self.app.logger, level="ERROR"):
             response = self.client.post("/measure", data=self.payload())
         self.assertEqual(response.status_code, 500)
         self.assertEqual(response.json["status"], "error")
         self.assertNotIn("test failure", response.json["error"])
-        with patch("app.run_pipeline", return_value={"status": "ok"}):
+        with patch("bodymeasure.pipeline.measure", return_value={"status": "ok"}):
             self.assertEqual(self.client.post("/measure", data=self.payload()).status_code, 200)
 
     def test_uploads_stay_in_memory(self):
@@ -100,13 +101,15 @@ class AppTests(unittest.TestCase):
             self.assertEqual(validate_upload(data, "front").shape, (256, 256, 3))
         buffer = io.BytesIO()
         source = Image.new("RGB", (160, 240), "white")
-        exif = source.getexif(); exif[274] = 6
+        exif = source.getexif()
+        exif[274] = 6
         source.save(buffer, "JPEG", exif=exif)
         image = validate_upload(FileStorage(stream=io.BytesIO(buffer.getvalue()), filename="rotated.jpg"), "front")
         self.assertEqual(image.shape[:2], (160, 240))
 
 
 class RealPhotoIntegrationTests(unittest.TestCase):
+    @unittest.skipUnless((Path(__file__).resolve().parents[1]/"uploads/front.jpg").exists(), "Optional local sample photos not distributed")
     def test_existing_sample_pair_real_models(self):
         root = Path(__file__).resolve().parents[1]
         client = create_app().test_client()
