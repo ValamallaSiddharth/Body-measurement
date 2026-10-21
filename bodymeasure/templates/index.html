@@ -38,6 +38,7 @@
     #error { color: #8c2424; background: #fff1ef; border: 1px solid #edc3bd; padding: 16px; border-radius: 9px; margin-bottom: 20px; }
     .height { font-size: 2rem; font-weight: 700; margin: 8px 0; }
     table { width: 100%; border-collapse: collapse; margin-top: 22px; }
+    .table-scroll { overflow-x: auto; }
     th, td { padding: 12px; text-align: left; border-bottom: 1px solid #e1e8e3; }
     th:not(:first-child), td:not(:first-child) { text-align: right; font-variant-numeric: tabular-nums; }
     .group th { background: #edf4ef; font-size: .8rem; letter-spacing: .04em; text-transform: uppercase; }
@@ -84,7 +85,7 @@
     <div class="muted">Estimated height</div>
     <p id="height" class="height"></p>
     <p id="confidence" class="muted"></p>
-    <table><thead><tr><th scope="col">Measurement</th><th scope="col">cm</th><th scope="col">inches</th></tr></thead><tbody id="measurement-rows"></tbody></table>
+    <div class="table-scroll"><table><thead><tr><th scope="col">Measurement</th><th scope="col">cm</th><th scope="col">inches</th></tr></thead><tbody id="measurement-rows"></tbody></table></div>
     <div id="warnings"><h3>Accuracy & capture notes</h3><ul id="warning-list"></ul></div>
   </section>
   <p class="muted">These estimates use adult head-size proportions and can be substantially wrong. They are not suitable for medical decisions or precise tailoring.</p>
