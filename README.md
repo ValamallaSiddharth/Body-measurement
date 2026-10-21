@@ -1,206 +1,194 @@
-# Two-photo adult body measurement estimates
+# Two-Photo Adult Body Measurement & Height Estimation
 
-Python **3.11**, Flask, MediaPipe Solutions, OpenCV and NumPy. Supply front and
-90-degree side photos of the same adult, gender, and optionally a known height.
-The web app, CLI and evaluator use **one** entry point:
-`bodymeasure.pipeline.measure(front_bgr, side_bgr, gender, options=None)`.
-Images, multipart buffers, masks and inference results stay in memory. HTTP and
-CLI inference do not save them. The offline evaluation command explicitly writes
-CSV reports, never photos or masks.
+Python **3.11**, Flask, MediaPipe Solutions, OpenCV-headless and NumPy.
+Estimates adult body measurements and stature from two uncalibrated photos (full-body front + 90-degree side profile) and gender (`male` or `female`), without requiring the user to provide their height.
 
-## Install and run
+All processing strictly stays in memory. Uploaded images, intermediate buffers, segmentation masks, and results are never written to disk during requests.
 
+---
+
+## Quickstart
+
+### Installation & Server Execution
 ```powershell
+# Create and activate Python 3.11 environment
 py -3.11 -m venv .venv-311
 .\.venv-311\Scripts\Activate.ps1
+
+# Install package dependencies
 python -m pip install ".[dev]"
-bodymeasure-server
+
+# Run Flask server on localhost:5000
+python -m flask --app bodymeasure.app run --host 127.0.0.1 --port 5000
 ```
 
-Open `http://127.0.0.1:5000`. `HOST` and `PORT` configure the development server.
-`python app.py` remains a source-checkout launcher. `bodymeasure-server` works
-from an installed wheel without this checkout. On Linux/macOS use
-`python3.11 -m venv .venv-311` and `source .venv-311/bin/activate`.
-The prepared Windows environment is `.venv-fresh`.
+Open `http://127.0.0.1:5000` in your web browser.
 
-The page is packaged at `bodymeasure/templates/index.html`; CSS and JavaScript
-are inline. No external frontend service, build process or static assets are
-needed. Open the server URL rather than the HTML file. `window.API_BASE_URL` can
-set a separate backend origin. CORS allows all origins without credentials.
-
+### CLI Execution
 ```powershell
-bodymeasure --front uploads/front.jpg --side uploads/side.jpg --gender male --height-cm 175
-python -m bodymeasure --front uploads/front.jpg --side uploads/side.jpg --gender female
+# Measure without supplying height (multi-cue fused scale)
+python -m bodymeasure --front uploads/front.jpg --side uploads/side.jpg --gender male
+
+# Optional known height override
+python -m bodymeasure --front uploads/front.jpg --side uploads/side.jpg --gender female --height-cm 165
 ```
 
-Omit `--height-cm` to use the head prior. JSON goes to stdout; CLI errors return
-exit code 1 (argument syntax errors use argparse's exit code 2). MediaPipe may
-emit diagnostic messages on stderr.
+---
 
-## Shared pipeline
+## Pipeline Architecture & Accuracy Fixes
 
-1. `validation.validate_upload`: enforce encoded format and size limits, apply
-   EXIF rotation, composite transparency onto white and resize to at most 1280 px.
-2. `detection.detect_pose`: 33 landmarks; visible essential shoulders, hips, knees
-   and ankles. The front requires both sides; the side requires one side per pair.
-   Out-of-frame points are clamped with warnings. Missing essential joints reject
-   the capture. The pure `clean_mask` helper processes Selfie Segmentation output
-   using morphology and the largest connected component.
-3. `prepare_view`: find a head-local silhouette vertex, visible ground and front
-   Face Mesh chin (landmark 152). Check that segmentation covers essential joints.
-   Boundary contact warns; bottom contact uses visible foot landmarks, falling
-   back to ankles, and reduces quality. A body span below 100 px is rejected.
-4. `estimate_scale`: when supplied, known height (120-220 cm, inclusive) sets
-   each view's independent `cm_per_px = height_cm / body_pixel_height`. A valid
-   front head anchor differing by more than 10% warns. Without known height,
-   use front vertex-to-chin priors of 23.2 cm male / 21.8 cm female, accepting
-   head/body ratios 0.11-0.16. Missing/implausible chin falls back to 175 cm male /
-   162 cm female. **No scale comes from the side face.** Reference-object support
-   is not implemented; the optional height anchor is the extension point for a
-   future validated calibration adapter.
-5. `capture_checks`: warn about orientation using shoulder/torso ratios, large
-   differences in normalized torso proportions, and wide silhouettes suggesting
-   bulky clothing or merged arms. Multiple large segmentation components warn
-   about possible extra people or fragments. These are heuristics, not identity
-   verification, reliable people counts or clothing classifiers.
-6. Measurement functions: use outer shoulder spans, matching normalized torso
-   slices, Ramanujan ellipse circumferences and joint-chain lengths. Contaminated
-   torso slices use explicit proportion fallbacks; missing wrist geometry uses a
-   height prior. Merged front thighs are split at the hip midpoint and labeled
-   estimated. Inseam is a hip-to-ankle proxy, not a tailoring crotch measurement.
-7. `sanity_checks`: broad gender-specific absolute and height-relative ranges for
-   every output. An implausible value is retained, named in a warning and changed
-   to `estimated`; overall confidence becomes low. These are engineering screening
-   ranges, not validated population norms. A 70.9 cm neck is explicitly flagged.
-8. `measurement_confidence`: only `medium` or `low`, never `high`. Assumed/prior
-   scale, capture warnings, implausible values or estimated major girths lower
-   confidence. This is a quality heuristic, not a probability or error interval.
+The pipeline executes through sequential in-memory stages:
 
-Geometry, scale, mask processing and quality stages are independently testable.
-MediaPipe adapters are isolated, and tests can inject synthetic landmarks/masks.
-The optional Python-only `options={"debug": True}` returns overlays as in-memory
-data URIs; the HTTP endpoint does not enable this option.
+1. **Validation & Normalization (`validation.py`)**:
+   - Enforces image formats (JPEG, PNG, WebP), size limits, EXIF orientation correction, and resizes to a maximum dimension of 1280 px.
+2. **Pose Detection & Dual-Pass Smoothing (`detection.py`)**:
+   - Runs MediaPipe Pose (`model_complexity=2`, `static_image_mode=True`) on both original and horizontally flipped images.
+   - Averages bilateral landmarks weighted by visibility to stabilize keypoint coordinates.
+3. **Silhouette Segmentation (`detection.py`)**:
+   - Uses MediaPipe Selfie Segmentation with morphological closing and opening.
+   - Extracts the primary human connected component.
+4. **Arm vs. Torso Isolation (Fix 1, `pipeline.py`)**:
+   - Constructs a torso-only mask by subtracting shoulder-elbow-wrist corridor lines and wrist hand discs.
+   - Clips torso horizontal runs at chest, waist, and hips to a dynamic corridor between shoulder and hip lines.
+   - Flags arm contamination and applies biacromial/deltoid proportion fallbacks with capture tips if arms are merged.
+5. **Leg Separation & Inseam (Fix 2, `pipeline.py`)**:
+   - Scans rows downward from the pelvis to detect the crotch point where the central silhouette splits into two legs.
+   - Measures inseam directly from crotch to ankle.
+   - Samples thigh circumference between crotch and knee; if legs touch continuously, splits along the pelvis midline, reports `"estimated"`, and warns `"legs merged"`.
+6. **Side-View Profile Joint Recovery (Fix 3, `detection.py`)**:
+   - Requires at least one visible joint ($\ge 0.5$) for side-view hip, knee, and ankle pairs.
+   - Automatically recovers occluded joints using the opposite side landmark or leg proportion projections along the hip-ankle line.
+7. **Multi-Cue Scale Fusion Without User Height (Fix 4, `pipeline.py`)**:
+   - Replaces single head-prior scaling with an inverse-variance fused multi-cue model:
+     - *Head Cue:* 3D Face Mesh chin to skull curve crown (clips hair volume) with head pitch compensation.
+     - *Neck-Shoulder Cue:* Distance between ear and shoulder span.
+     - *Torso Proportion:* Shoulder-to-hip skeletal distance.
+     - *Leg Proportion:* Hip-to-ankle skeletal distance.
+     - *Camera Tilt Correction:* Cosine adjustment from vertical body axis.
+     - *Population Prior:* Gaussian regularizer (male: $175 \pm 7\text{ cm}$, female: $162 \pm 6.5\text{ cm}$).
+   - Drops statistical outliers ($> 2.5\times\text{MAD}$); shrinks lone cues toward the population prior so extreme implied heights (e.g. $191\text{ cm}$) are never output directly.
+   - Reports `uncertainty_band`, `uncertainty_cm`, and `cues_used`.
+8. **Plausibility Guards & Re-estimation (Fix 5, `pipeline.py`)**:
+   - Enforces physical screening bounds (e.g. neck $\le 50\text{ cm}$, waist $\le 110\%$ of hips, shoulder $\ge 35\text{ cm}$).
+   - Automatically catches anomalies and re-estimates values using anatomical fallbacks, downgrading source labels to `"estimated"`.
+9. **Circumference Calculation (`pipeline.py`)**:
+   - Uses Ramanujan's high-precision first ellipse approximation combining front widths and side depths.
+   - Formats all values in both centimeters and inches rounded to 1 decimal place.
 
-## Sources and accuracy
+---
 
-Every height/measurement value contains `{ "cm": 175.0, "in": 68.9, "source": "..." }`.
-Values are rounded to one decimal; inches use unrounded cm / 2.54.
-The UI displays source badges with keyboard-accessible tooltip descriptions:
+## API Reference
 
-| Source | Meaning |
-| --- | --- |
-| `measured` | User-supplied height, or image-derived geometry using that scale. Not a validated tape measurement. |
-| `estimated` | Head-prior scale, proportion fallback, uncertain geometry or a plausibility warning. |
-| `assumed` | Fixed baseline height because a reliable scale anchor was unavailable. |
+### `GET /`
+Serves the responsive single-page user interface packaged in `bodymeasure/templates/index.html`.
 
-Uncalibrated photos cannot uniquely determine absolute metric size. Known height
-fixes the scale ambiguity but does not resolve perspective, clothing, missing
-boundaries, segmentation errors or anatomical landmark bias. All estimates remain
-approximate. Adult priors are unsuitable for children. Do not use this for medical
-decisions or precise tailoring. A successful response means processing completed,
-not that its dimensions are accurate.
+### `GET /health`
+Returns JSON `{"status": "ok"}` indicating service availability.
 
-The six-subject archived evaluation is reported in [reports/README.md](reports/README.md)
-and `reports/uncalibrated/summary.csv`. It is a small convenience sample, not a
-validated accuracy guarantee. Reports include signed bias, MAE, RMSE, +/-2 cm and
-+/-5 cm rates, exclusions and failed captures. `_tbr` ground-truth entries are
-excluded; ambiguous anatomical columns are not substituted. Known-height
-evaluation excludes height itself from scoring to avoid input leakage.
+### `POST /measure`
+Multipart form-data endpoint for body measurement estimation.
 
-## API
+**Parameters:**
+- `front_image` *(file, required)*: Full-body front-facing photograph.
+- `side_image` *(file, required)*: Full-body 90-degree profile photograph.
+- `gender` *(string, required)*: `"male"` or `"female"`.
+- `height_cm` *(float, optional)*: Known stature in cm ($120\text{--}220\text{ cm}$). If omitted, multi-cue scale fusion is used.
 
-- `GET /`: packaged single-page interface.
-- `GET /health`: process availability, not model readiness.
-- `POST /measure`: multipart `front_image`, `side_image`, `gender` (`male` or
-  `female`, case-insensitive), optional `height_cm` (finite number, 120-220).
-
+**Sample Request:**
 ```powershell
-curl.exe -F "front_image=@uploads/front.jpg" -F "side_image=@uploads/side.jpg" -F "gender=male" -F "height_cm=175" http://127.0.0.1:5000/measure
+curl.exe -F "front_image=@uploads/front.jpg" `
+         -F "side_image=@uploads/side.jpg" `
+         -F "gender=male" `
+         http://127.0.0.1:5000/measure
 ```
 
-Success retains `status`, `height`, `measurements`, `confidence`, `warnings` and
-adds `scale_anchor` (`user_height`, `head_prior`, `adult_baseline`). Measurement
-groups remain `head_neck` (neck), `torso` (shoulder_width, chest, waist, hips,
-torso_length), `arms` (arm_length, wrist), `legs` (inseam, thigh). Source fields
-are additive; the cm/in keys are unchanged.
+**Sample Response:**
+```json
+{
+  "status": "ok",
+  "gender": "male",
+  "confidence": "low",
+  "scale_anchor": "head_prior",
+  "height": {
+    "cm": 167.0,
+    "in": 65.7,
+    "source": "estimated",
+    "uncertainty_cm": 8.0,
+    "uncertainty_band": "167.0 cm +/- 8.0",
+    "cues_used": [
+      "head_prior",
+      "neck_shoulder_cue",
+      "torso_proportion",
+      "population_regularizer"
+    ]
+  },
+  "measurements": {
+    "head_neck": {
+      "neck": { "cm": 40.9, "in": 16.1, "source": "estimated" }
+    },
+    "torso": {
+      "shoulder_width": { "cm": 46.8, "in": 18.4, "source": "estimated" },
+      "chest": { "cm": 99.7, "in": 39.3, "source": "estimated" },
+      "waist": { "cm": 91.6, "in": 36.1, "source": "estimated" },
+      "hips": { "cm": 114.6, "in": 45.1, "source": "estimated" },
+      "torso_length": { "cm": 49.3, "in": 19.4, "source": "estimated" }
+    },
+    "arms": {
+      "arm_length": { "cm": 48.4, "in": 19.1, "source": "estimated" },
+      "wrist": { "cm": 16.7, "in": 6.6, "source": "estimated" }
+    },
+    "legs": {
+      "inseam": { "cm": 52.5, "in": 20.7, "source": "estimated" },
+      "thigh": { "cm": 50.5, "in": 19.9, "source": "estimated" }
+    }
+  },
+  "warnings": [
+    "Height estimated via multi-cue fusion with population regularization; absolute size is uncalibrated.",
+    "Tip: Keep arms slightly away from the body in the front and side photos for accurate torso measurements.",
+    "Inseam measured from segmented crotch level to ankle."
+  ]
+}
+```
 
-Errors use `{ "status": "error", "error": "readable message" }`:
-400 invalid input, 413 upload limits, 422 unusable capture, 503 busy, 500 internal
-failure. Unknown routes/methods use JSON 404/405. Exception details stay in logs.
+---
 
-Limits: JPEG, PNG or still WebP; 12 MiB per image, 25 MiB per request,
-20 megapixels, at least 128 px per side; maximum eight multipart parts and
-128 KiB non-file form memory. Responses are `no-store`. Browser requests time out
-after 120 seconds. Browser abort does not cancel native server inference.
+## Capture Tips for Maximum Accuracy
 
-## Capture guidance
+1. **Posture:**
+   - Stand straight looking forward into the camera lens at eye level.
+   - **Arms:** Hold arms slightly away from the torso (A-pose, 5–10 cm gap) to ensure clean torso contours.
+   - **Legs:** Stand with feet shoulder-width apart so the crotch and thighs separate cleanly.
+2. **Clothing:**
+   - Wear snug, form-fitting attire (compression wear, leggings, swimwear). Loose or baggy clothes inflate circumferences.
+3. **Camera Placement:**
+   - Position the camera level at **navel / mid-torso height**, approximately **2.5 to 3 meters** away.
+   - Avoid high or low angles pointing up or down to prevent perspective foreshortening.
+4. **Environment:**
+   - Ensure the entire body from top of head to bottom of feet is within the frame.
+   - Use even lighting against a plain, contrasting background without heavy floor shadows.
 
-Use one adult, the same person in both views, fitted clothing, even light and a
-contrasting plain background. Include margins above the head and below feet.
-Stand straight with separated feet and arms away from the torso; side-view arms
-should be slightly forward. Keep the camera level near hip height at the same
-distance/zoom. Avoid wide-angle lenses, hats, bulky clothes and thick shoes.
+---
 
-## Testing and evaluation
+## Testing & Verification
 
 ```powershell
-python -m pip check
-python -m ruff check app.py bodymeasure scripts tests gunicorn.conf.py
-python -m pytest -q
+# Run the complete test suite (synthetic & endpoint tests)
+pytest --basetemp=./.pytest_temp
+
+# Run sample image regression comparison
+python scripts/regression.py
+
+# Run frontend UI verification
 node tests/test_frontend.cjs
+
+# Run HTTP endpoint integration test
 python tests/verify_http.py
-python scripts/evaluate.py --output-dir reports/uncalibrated
-python scripts/evaluate.py --known-height --output-dir reports/known_height
-python -m build
 ```
 
-Synthetic pytest tests cover the current shared algorithm without photos.
-Optional real-photo integration tests use `uploads/front.jpg` and `side.jpg`;
-they skip when those local files are not distributed. `verify_http.py` explicitly
-requires them. Tests include format limits, EXIF, in-memory multipart streams,
-JSON errors, CLI routing, source badges, scale anchors, contamination, merged
-thighs, confidence and sanity checks. The JS suite is a DOM harness, not full
-interactive browser coverage. CI runs lint, tests, package and Docker builds.
+---
 
-## Production
+## Known Limitations
 
-```sh
-pip install '.[server]'
-gunicorn --config gunicorn.conf.py bodymeasure.web:app
-docker build -t bodymeasure .
-docker run --rm -p 5000:5000 --read-only --tmpfs /tmp:rw,noexec,nosuid,size=128m bodymeasure
-```
-
-Gunicorn is for Unix/Linux; the Windows command is a development server. The
-default configuration uses **one worker, two gthread threads**, one inference
-slot and a 150-second worker/graceful timeout. Model objects are created and
-closed per request; no unsafe cross-thread model sharing. A second inference
-request gets 503 while a health check can run on the other thread. The semaphore
-is per-process: raising worker count permits one inference per worker and raises
-memory/CPU demand. There is no distributed request queue or cancellation.
-
-Gunicorn's gthread timeout is a worker-liveness timeout, **not a hard per-request
-deadline**. Set a reverse proxy request-body limit of 25 MiB and an upstream read
-timeout near 150 seconds. Client/proxy timeout still cannot interrupt native
-inference. Container heartbeat/cache files use ephemeral storage, and bytecode
-writing is disabled. Production photos and masks never reach disk. Restrict CORS
-and add access control at the deployment boundary if exposing a private service.
-
-Deployment choices follow [Gunicorn settings](https://docs.gunicorn.org/en/stable/settings.html)
-and its [threading design](https://docs.gunicorn.org/en/stable/design.html).
-HTML is included as [setuptools package data](https://setuptools.pypa.io/en/stable/userguide/datafiles.html).
-
-## Dependencies and legacy assets
-
-MediaPipe 0.10.21 is pinned for bundled Pose, Selfie Segmentation and Face Mesh
-Solutions APIs on Python 3.11. No PyTorch, training, licensed body model or runtime
-model download is needed. MediaPipe requires `opencv-contrib-python`; it coexists
-with the requested `opencv-python-headless`, both pinned to 4.11.0.86 and sharing
-`cv2`. Keep the environment isolated; do not independently upgrade/uninstall one.
-The Linux image includes libraries needed by the contrib wheel, so this is not
-a purely GUI-library-free dependency set. MediaPipe also brings JAX/audio/plotting
-dependencies that the app does not directly use.
-
-[LEGACY_ASSETS.md](LEGACY_ASSETS.md) lists reconciled unused configurations,
-models, samples and old outputs, plus deleted/replaced tests. They are not wheel
-or Docker contents. Dataset and binary assets were retained, not deleted.
+- **Monocular 2D Scale:** Without camera calibration markers or depth sensors (LiDAR), uncalibrated photos rely on statistical anatomical ratios. Entering an exact height (`height_cm`) eliminates scale uncertainty.
+- **Clothing Silhouettes:** The algorithm segments visible outer contours. Loose fabric, hoodies, or thick footwear cannot be penetrated and will inflate measurements.
+- **Extreme Poses / Joint Occlusion:** Heavy body rotation or crossed limbs degrade landmark visibility and trigger heuristic fallbacks.

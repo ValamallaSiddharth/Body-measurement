@@ -1,22 +1,56 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Caches and test runners
+.pytest_cache/
+.pytest_temp/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Virtual environments and tooling
 .venv/
-.venv-fresh/
-.venv-311/
+.venv*/
+venv/
+ENV/
 .tools/
 .kilo/
-__pycache__/
-*.pyc
+
+# IDE and OS files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Environment variables & secrets
+.env
+.env.*
+*.pem
+*.key
+
+# Legacy models and outputs
 outputs/
 models/
 config.json
 calibration.json
-*.egg-info/
-.venv*/
-build/
-dist/
-.pytest_cache/
-.pytest_temp/
-.ruff_cache/
 archive/
 archive.zip
 *.task
 *.pth
+
+# Uploads directory (retain integration sample images only)
+uploads/*
+!uploads/front.jpg
+!uploads/side.jpg
